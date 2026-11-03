@@ -1,0 +1,4 @@
+customtkinter>=5.2
+# optional:
+# tomli          ; python_version < "3.11"
+# llama-cpp-python   # for backend.type = "llamacpp_python"

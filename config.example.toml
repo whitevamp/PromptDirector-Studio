@@ -1,0 +1,156 @@
+# promptdirector 2.7.0 configuration (saved 2026-11-02 19:08)
+[backend]
+type = "ollama"
+host = ""
+api_key = ""
+timeout = 300
+max_retries = 3
+retry_backoff = 2.0
+verify_connection = true
+
+[model]
+name = "llama3.1:8b"
+path = ""
+n_ctx = 8192
+n_gpu_layers = -1
+temperature = 0.9
+top_p = 0.95
+max_tokens = 1500
+keep_alive = "10m"
+
+[generation]
+count = 5
+targets = ["krea2"]
+min_words = 0
+max_words = 0
+filler_check = true
+max_filler_hits = 2
+compat_rules = true
+tag_prefix = "masterpiece, best quality, amazing quality"
+system_prompt_file = "system_prompt.txt"
+presets_file = "presets.json"
+seed_mode = "builtin"
+scenes_file = ""
+user_template = "Scene description:\n{scene}"
+random_seed = 0
+content_rating = "as_file"
+min_paragraphs = 3
+max_attempts_per_prompt = 3
+dedupe = true
+strip_reasoning = true
+clean_output = true
+
+[llama_server]
+managed = false
+llama_cpp_dir = ""
+gguf_dir = ""
+gpu = "0"
+n_gpu_layers = 99
+flash_attn = "on"
+parallel = 1
+cache_type = ""
+extra_args = ""
+startup_timeout = 300
+stop_when_app_closes = true
+
+[comfy]
+enabled = false
+save_prompts = true
+url = "http://127.0.0.1:8188"
+models_dir = ""
+cache_file = "comfy_models_cache.json"
+workflow = "custom"
+workflow_file = ""
+checkpoint = ""
+diffusion_model = ""
+text_encoder = ""
+text_encoder_2 = ""
+vae = ""
+prompt_source = "auto"
+negative_prompt = "lowres, worst quality, bad anatomy, bad hands, watermark, signature, text"
+size_mode = "auto"
+comic_scale = 1.0
+width = 0
+height = 0
+steps = 0
+cfg = 0.0
+guidance = 3.5
+sampler = ""
+scheduler = ""
+clip_skip = 2
+seed = 0
+images_per_prompt = 1
+filename_prefix = "pds"
+send_mode = "end"
+wait_for_images = true
+download_images = false
+unload_llm = true
+free_vram_after = true
+timeout = 900
+rotation = "off"
+rotation_target = "auto"
+rotation_count = 2
+rotation_models = []
+rotation_compatible_only = true
+model_search_dirs = ""
+
+[comic]
+enabled = false
+layout = "2x3"
+mode = "vignettes"
+format = "prose"
+location_mode = "auto"
+speech_bubbles = false
+
+[scene]
+random_enabled = true
+people = [{"role" = "", "age" = "", "ethnicity" = "", "hair_color" = "", "hair_length" = "", "clothing" = ""}, {"role" = "", "age" = "", "ethnicity" = "", "hair_color" = "", "hair_length" = "", "clothing" = ""}, {"role" = "", "age" = "", "ethnicity" = "", "hair_color" = "", "hair_length" = "", "clothing" = ""}, {"role" = "", "age" = "", "ethnicity" = "", "hair_color" = "", "hair_length" = "", "clothing" = ""}, {"role" = "", "age" = "", "ethnicity" = "", "hair_color" = "", "hair_length" = "", "clothing" = ""}, {"role" = "", "age" = "", "ethnicity" = "", "hair_color" = "", "hair_length" = "", "clothing" = ""}]
+
+[scene.fields]
+style = ""
+characters = ""
+subject = ""
+action = ""
+camera_angle = ""
+shot = ""
+lighting = ""
+location = ""
+time_weather = ""
+composition = ""
+extra = ""
+
+[scene.random]
+style = true
+characters = true
+subject = true
+action = true
+camera_angle = true
+shot = true
+lighting = false
+location = true
+time_weather = true
+composition = false
+
+[scene.random_people]
+role = true
+age = true
+ethnicity = false
+hair_color = true
+hair_length = true
+clothing = false
+
+[output]
+directory = ""
+formats = ["txt", "jsonl"]
+filename_prefix = "prompts"
+timestamp_subfolder = true
+separator = "\n\n----------------------------------------\n\n"
+
+[logging]
+directory = "logs"
+log_file = "promptdirector.log"
+debug = false
+debug_file = "promptdirector.debug.log"
+console_level = "INFO"
+max_bytes = 5000000
+backup_count = 5
