@@ -1,0 +1,37 @@
+PromptDirector Studio
+Copyright (c) 2026 whitevamp
+
+This work is licensed under the Creative Commons
+Attribution-NonCommercial-ShareAlike 4.0 International License (CC BY-NC-SA 4.0).
+
+    https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+Full legal code:
+
+    https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
+
+In short (this summary is not a substitute for the license):
+
+  You are free to:
+    - Share: copy and redistribute this software in any medium or format.
+    - Adapt: remix, transform, and build upon this software.
+
+  Under the following terms:
+    - Attribution: you must give appropriate credit to "whitevamp" as the
+      original author, provide a link to the license, and indicate if
+      changes were made.
+    - NonCommercial: you may not use this software or any part of it for
+      commercial purposes.
+    - ShareAlike: if you remix, transform, or build upon this software, you
+      must distribute your contributions under the same license
+      (CC BY-NC-SA 4.0).
+    - No additional restrictions: you may not apply legal terms or
+      technological measures that legally restrict others from doing
+      anything the license permits.
+
+This software is provided "as is", without warranty of any kind.
+
+Third-party components keep their own licenses:
+  - CustomTkinter (MIT License), installed separately via pip.
+  - Models, LoRAs, ComfyUI and ComfyUI workflows used with this software are
+    not part of it and are covered by their own licenses.
