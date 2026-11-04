@@ -34,7 +34,7 @@ from typing import Any, Callable
 import pd_comfy as comfy
 import pd_llamaserver as lserver
 
-__version__ = "2.8.0"
+__version__ = "2.8.2"
 
 APP_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("promptdirector")
@@ -382,6 +382,10 @@ def load_config(explicit: str | None = None) -> tuple[dict, Path | None]:
     path = find_config_file(explicit)
     if path:
         cfg = deep_merge(cfg, load_config_file(path))
+        cc = cfg.get("comfy") or {}
+        if str(cc.get("filename_prefix", "")).strip().lower() == "kpg":    # the old app name's default
+            cc["filename_prefix"] = "pds"
+            log.info("ComfyUI image prefix: the old default 'kpg' is now 'pds' (saved with your next Save)")
     return cfg, path
 
 
@@ -1244,6 +1248,27 @@ def generator_addendum(cfg: dict) -> str:
 
 
 # Content guard. Always on when NSFW is allowed; it cannot be switched off.
+SCENE_INPUT_ADDENDUM = (
+    "\n\n________________________________________\n"
+    "11. SCENE INPUT FORMAT\n\n"
+    "The scene description you receive is a list of labeled details (for example Style, Number of characters, "
+    "Characters, Action, Camera angle, Shot / distance, Lighting, Location, Time / weather, Focus / composition, "
+    "Additional notes), sometimes preceded by a short free-text scene idea.\n"
+    "Some details were chosen by the user and some were assembled at random; treat all of them as the user's request.\n"
+    "Every detail that is given must appear in the final prompt and must not be contradicted: keep the exact style, "
+    "number of characters, character roles, camera angle, shot distance, lighting, location and time/weather that "
+    "are listed.\n"
+    "Place each detail where the instructions above require it (style, camera angle, distance and lighting in the "
+    "opening sentence; characters in their own paragraphs; location and weather in the environment paragraph; "
+    "focus and composition in the final paragraph).\n"
+    "Lines starting with \"Character 1:\", \"Character 2:\" and so on describe the characters in that order: use "
+    "each line's role, age, ethnicity, hair and clothing for that character's paragraph.\n"
+    "Any detail that is not listed is your choice: pick what best fits the scene.\n"
+    "Invent all remaining concrete visual details yourself (appearance, clothing, posture, limbs, objects, surfaces).\n"
+    "Each response is an independent image; do not refer to previous prompts.\n"
+    "The output must consist solely of the prompt itself, with no explanations, preambles or postscripts."
+)
+
 ADULT_RULE = (
     "\n\nCONTENT SAFETY (always applies)\n"
     "Every character is an adult (at least 18) with a clearly adult face and body; give each character an adult age. "
@@ -1306,10 +1331,17 @@ def check_scene_inputs(cfg: dict, fixed_scenes: list[str] | None, presets: dict 
                             k, len(bad), "y" if len(bad) == 1 else "ies")
 
 
+SYSTEM_PROMPT_URL = "https://civitai.red/models/2976901/moody-krea2-prompt-writing-skill-llm-system-prompt"
+
+
 def read_system_prompt_file(cfg: dict) -> str:
     path = resolve_path(cfg["generation"]["system_prompt_file"])
     if not path.is_file():
-        raise ConfigError(f"System prompt file not found: {path}")
+        raise ConfigError(
+            f"System prompt file not found: {path}\n"
+            "It isn't included with the app. Download it from " + SYSTEM_PROMPT_URL +
+            " and save it as system_prompt.txt in the app folder, or write your own "
+            "(the System Prompt tab can save it). See 'Notes: the system prompt' in the README.")
     return path.read_text(encoding="utf-8", errors="replace")
 
 
@@ -1323,6 +1355,8 @@ def prepare_system_prompt(cfg: dict, text: str | None = None) -> str:
         text = "\n".join(kept) + SFW_ADDENDUM
     else:
         text += ADULT_RULE
+    if not comic_on(cfg) and "SCENE INPUT FORMAT" not in text.upper():
+        text += SCENE_INPUT_ADDENDUM      # how to read the app's labeled scene details (any system prompt)
     text += comic_addendum(cfg) if comic_on(cfg) else generator_addendum(cfg)
     log.info("System prompt ready (%d chars, target %d-%d words)", len(text), *word_range(cfg))
     log.debug("System prompt:\n%s", text)

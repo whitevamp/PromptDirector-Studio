@@ -384,7 +384,7 @@ def _apply_overrides(wf: dict, cc: dict, seed: int, w: int, h: int, batch: int) 
                 inp["width"], inp["height"] = w, h
             if "batch_size" in inp and not isinstance(inp["batch_size"], list):
                 inp["batch_size"] = batch
-        if cls in ("SaveImage", "Image Save") and "filename_prefix" in inp:
+        if "filename_prefix" in inp and isinstance(inp["filename_prefix"], str):   # any save node
             inp["filename_prefix"] = cc.get("filename_prefix") or "pds"
         if cc.get("steps") and "steps" in inp and not isinstance(inp["steps"], list):
             inp["steps"] = int(cc["steps"])

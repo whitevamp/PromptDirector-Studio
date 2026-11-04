@@ -1,8 +1,10 @@
-# PromptDirector Studio v2.8.0
+# PromptDirector Studio v2.8.2
 
 by **whitevamp**, licensed under CC BY-NC-SA 4.0 (free for non-commercial use; see [License](#license)).
 
 Generates character-centric image prompts with a local LLM, following `system_prompt.txt`.
+
+> **`system_prompt.txt` is not included.** You need your own copy before the first run. See [Notes: the system prompt](#notes-the-system-prompt).
 It has a GUI (CustomTkinter) and a CLI, which share the same engine and config file.
 
 ## Files
@@ -16,7 +18,8 @@ It has a GUI (CustomTkinter) and a CLI, which share the same engine and config f
 | `pd_picker.py` | Searchable picker window for long model lists |
 | `pd_comfy.py` | ComfyUI connection: model lists, workflows, sending, waiting, downloading |
 | `pd_core.py` | Shared engine: config, backends, scene builder, logging, output. `DEFAULT_CONFIG` and `DEFAULT_PRESETS` live here |
-| `system_prompt.txt` | Your system prompt (cleaned up, plus section 11 on the scene input format) |
+| `system_prompt.txt` | **Not included**: the system prompt you supply (see [Notes](#notes-the-system-prompt)) |
+| `.gitignore` | Keeps `system_prompt.txt`, your `config.toml`, caches and output out of git |
 | `presets.json` | The random-value lists (editable in the GUI's Presets tab) |
 | `config.example.toml` | Every setting with its default value |
 | `pd_gui_bench.py` | Measures CustomTkinter speed on your machine (for troubleshooting a slow GUI) |
@@ -27,6 +30,7 @@ It has a GUI (CustomTkinter) and a CLI, which share the same engine and config f
 pip install customtkinter          # GUI only; the CLI needs nothing extra
 # optional: pip install tomli (Python < 3.11), pip install llama-cpp-python (in-process .gguf)
 cp config.example.toml config.toml # optional
+# put your system_prompt.txt in this folder (see "Notes: the system prompt")
 ollama pull llama3.1:8b
 python promptdirector_gui.py
 ```
@@ -268,6 +272,23 @@ Each run is saved to `<output>/prompts_YYYYmmdd_HHMMSS/` in any of these formats
 
 Prompts are written as soon as each one is made, so stopping a run never loses work.
 Logs go to `<output>/logs/`. The main log is always written. The debug log is a separate file with full requests and responses, turned on with `--debug` or the GUI switch.
+
+## Notes: the system prompt
+
+`system_prompt.txt` is **not part of this project** and isn't in the repository. Its author asks that it not be redistributed without consent, so it's listed in `.gitignore`. You need your own copy, saved as `system_prompt.txt` in the app folder (or set another path under Generation > System prompt file). There are two ways to get one:
+
+1. **Download it** from its author on Civitai: [Moody Krea2 Prompt Writing Skill (LLM system prompt)](https://civitai.red/models/2976901/moody-krea2-prompt-writing-skill-llm-system-prompt). The app was built around this prompt.
+2. **Write your own.** Paste or type it into the **System Prompt** tab and press Save, which creates the file. It should tell the model how to structure the image prompt (the opening line, a paragraph per character, environment, composition) and that the reply must be only the prompt.
+
+You don't need to add anything for the app's own features. On every run the app appends these to whatever prompt you use:
+- the **scene input format** (how to read the labeled details and the `Character 1:`, `Character 2:` lines), unless your prompt already has a "SCENE INPUT FORMAT" section;
+- the **length and focus** rules (word range, no mood or filler words);
+- the **content safety** rule (adults only, consent), or the SFW rule in SFW mode;
+- the **comic** instructions when Comic mode is on.
+
+The app's built-in content checks run on every result no matter which system prompt you use.
+
+If the file is missing, the run stops with a message that points here.
 
 ## License
 

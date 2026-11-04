@@ -1,0 +1,12 @@
+# Not redistributable: get your own copy (see "Notes: the system prompt" in README.md)
+system_prompt.txt
+
+# Your local settings and caches
+config.toml
+comfy_models_cache.json
+__pycache__/
+*.pyc
+
+# Output
+prompts_*/
+logs/
