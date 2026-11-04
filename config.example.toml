@@ -17,6 +17,7 @@ temperature = 0.9
 top_p = 0.95
 max_tokens = 1500
 keep_alive = "10m"
+thinking = "off"          # off / on / auto  (reasoning models like Qwen3: keep "off")
 
 [generation]
 count = 5
@@ -86,12 +87,14 @@ wait_for_images = true
 download_images = false
 unload_llm = true
 free_vram_after = true
+vram_wait = 30                  # after unloading the LLM, wait (s) until its VRAM is really free; 0 = off
 timeout = 900
 rotation = "off"
 rotation_target = "auto"
 rotation_count = 2
 rotation_models = []
 rotation_compatible_only = true
+compare_models = false          # true = every prompt on EVERY rotation model, same seed -> compare.html
 model_search_dirs = ""
 
 [comic]

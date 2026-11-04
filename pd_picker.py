@@ -1,3 +1,5 @@
+# PromptDirector Studio - Copyright (c) 2026 whitevamp
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0 (see LICENSE)
 """
 pd_picker.py — searchable list picker for long lists (thousands of models).
 

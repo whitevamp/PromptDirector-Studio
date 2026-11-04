@@ -1,3 +1,5 @@
+# PromptDirector Studio - Copyright (c) 2026 whitevamp
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0 (see LICENSE)
 """
 pd_comfy.py — send generated prompts to a ComfyUI server and (optionally) wait for / download the images.
 
@@ -96,6 +98,8 @@ DEFAULT_COMFY = {
     "rotation_count": 2,              # random: how many different models (<= number of prompts)
     "rotation_models": [],            # list: models in order
     "rotation_compatible_only": True, # only use models with the same architecture as the workflow's model
+    "compare_models": False,          # ON = every prompt is rendered on EVERY rotation model (same seed), to compare
+    "vram_wait": 30,                  # seconds to wait for the LLM's VRAM to be released before images (0 = off)
     "model_search_dirs": "",          # extra folders (separated by ;) where model files live, for the check
 }
 
@@ -460,8 +464,22 @@ def queue_prompt(cc: dict, workflow: dict, client_id: str) -> str:
     return pid
 
 
-def wait_for(cc: dict, prompt_id: str, stop_event=None, timeout: float | None = None) -> list[dict]:
-    """Poll /history until the job finishes. Returns the list of output image records."""
+def _exec_seconds(status: dict) -> float | None:
+    """Execution time of a finished job from ComfyUI's execution_start/_success timestamps (ms)."""
+    ts = {}
+    for m in status.get("messages", []) or []:
+        if isinstance(m, list) and len(m) > 1 and isinstance(m[1], dict) and "timestamp" in m[1]:
+            ts[m[0]] = m[1]["timestamp"]
+    if "execution_start" in ts and ("execution_success" in ts or "execution_error" in ts):
+        end = ts.get("execution_success", ts.get("execution_error"))
+        return max(0.0, (end - ts["execution_start"]) / 1000.0)
+    return None
+
+
+def wait_for(cc: dict, prompt_id: str, stop_event=None, timeout: float | None = None,
+             timing: dict | None = None) -> list[dict]:
+    """Poll /history until the job finishes. Returns the list of output image records.
+    If `timing` is given, timing['exec'] gets ComfyUI's own execution time (seconds) when it reports one."""
     timeout = float(timeout or cc.get("timeout") or 900)
     t0, delay = time.monotonic(), 1.0
     while time.monotonic() - t0 < timeout:
@@ -476,6 +494,8 @@ def wait_for(cc: dict, prompt_id: str, stop_event=None, timeout: float | None = 
                         if isinstance(m, list) and len(m) > 1 and m[0] == "execution_error"]
                 raise ComfyError("ComfyUI job failed: " + ("; ".join(msgs) or "see the ComfyUI console"))
             if status.get("completed", True):
+                if timing is not None:
+                    timing["exec"] = _exec_seconds(status)
                 images = []
                 for out in job.get("outputs", {}).values():
                     images += [i for i in out.get("images", []) if i.get("type", "output") == "output"]
@@ -493,6 +513,43 @@ def download_image(cc: dict, img: dict, dest_dir: Path) -> Path:
     out = dest_dir / img["filename"]
     out.write_bytes(data)
     return out
+
+
+def vram_free_gb(cc: dict) -> float | None:
+    """Free VRAM (GB) on ComfyUI's first GPU, or None if it doesn't say."""
+    devs = _request(cc, "GET", "/system_stats", timeout=10).get("devices") or []
+    for d in devs:
+        if d.get("vram_total"):
+            return d.get("vram_free", 0) / 2**30
+    return None
+
+
+def wait_for_vram(cc: dict, max_wait: float, stop_event=None) -> tuple[float | None, float | None, float]:
+    """After the LLM unloads, wait until ComfyUI's free VRAM stops rising (the release has finished).
+    Returns (free GB at start, free GB at end, seconds waited)."""
+    t0 = time.monotonic()
+    try:
+        first = last = vram_free_gb(cc)
+    except ComfyError:
+        return None, None, 0.0
+    if first is None or max_wait <= 0:
+        return first, first, 0.0
+    steady = 0
+    while time.monotonic() - t0 < max_wait:
+        if stop_event is not None and stop_event.is_set():
+            break
+        time.sleep(1.0)
+        try:
+            now = vram_free_gb(cc)
+        except ComfyError:
+            break
+        if now is None:
+            break
+        steady = steady + 1 if now - last < 0.1 else 0     # under 100 MB change = settled
+        last = now
+        if steady >= 2:
+            break
+    return first, last, time.monotonic() - t0
 
 
 def free_vram(cc: dict) -> None:
@@ -645,9 +702,13 @@ def check_compat(cc: dict, reference: str, candidates: list[str], folder_key: st
 
 
 def plan_rotation(cc: dict, n_jobs: int, lists: dict, template: dict | None,
-                  rng: random.Random) -> tuple[list[str] | None, str]:
-    """Model per prompt (consecutive prompts share a model). Returns (assignments or None, report)."""
+                  rng: random.Random, compare: bool | None = None) -> tuple[list[str] | None, str]:
+    """Model per prompt (consecutive prompts share a model). Returns (assignments or None, report).
+    Compare mode: returns the list of models, each of which renders every prompt."""
     mode = cc.get("rotation", "off")
+    compare = cc.get("compare_models", False) if compare is None else compare
+    if compare:
+        n_jobs = max(n_jobs, 10**6)          # no "more models than prompts" limit when comparing
     if mode == "off" or n_jobs < 1:
         return None, ""
     target = rotation_target(cc, template)
@@ -687,6 +748,9 @@ def plan_rotation(cc: dict, n_jobs: int, lists: dict, template: dict | None,
         if len(models) > n_jobs:
             raise ComfyError(f"Model rotation: {len(models)} models but only {n_jobs} prompt(s) - "
                              "generate at least as many prompts as models")
+    if compare:
+        return models, (f"Compare models ({mode}, {target.replace('_', ' ')}): every prompt is rendered on "
+                        f"{len(models)} model(s) with the same seed: " + ", ".join(models))
     base, extra = divmod(n_jobs, len(models))
     plan: list[str] = []
     parts = []
@@ -713,36 +777,71 @@ class ComfySender:
         self.sent = self.done = self.failed = 0
         self.image_files: list[str] = []
         self.plan: list[str] | None = None
+        self.compare: list[str] | None = None      # compare mode: every prompt goes to each of these
         self.target = rotation_target(cc, self.template)
+        self.timings: list[dict] = []              # one per finished image job
+        self._prompt_seeds: dict[int, int] = {}
+        self.compare_rows: list[dict] = []         # for compare.html
 
     def set_plan(self, n_jobs: int, lists: dict) -> str:
-        self.plan, report = plan_rotation(self.cc, n_jobs, lists, self.template, self.rng)
+        plan, report = plan_rotation(self.cc, n_jobs, lists, self.template, self.rng)
+        if self.cc.get("compare_models"):
+            self.compare = plan
+        else:
+            self.plan = plan
         return report
 
     def _seed(self) -> int:
         return int(self.cc.get("seed") or 0) or self.rng.randint(1, 2**48)
 
-    def send(self, index: int, prose: str, tags: str | None, size: tuple[int, int] | None) -> dict:
-        """Queue one prompt; waits/downloads if configured. Returns info for the record."""
-        seed = self._seed()
+    def prompt_seed(self, index: int) -> int:
+        """One seed per prompt, shared by every model in compare mode (a fair comparison)."""
+        if index not in self._prompt_seeds:
+            self._prompt_seeds[index] = self._seed()
+        return self._prompt_seeds[index]
+
+    def send(self, index: int, prose: str, tags: str | None, size: tuple[int, int] | None,
+             model: str | None = None) -> dict:
+        """Queue one prompt; waits/downloads if configured. Returns info for the record.
+        `model` (compare mode) renders this prompt on that model with the prompt's shared seed."""
         cc = self.cc
-        model = None
-        if self.plan and 1 <= index <= len(self.plan):
-            model = self.plan[index - 1]
-            cc = dict(self.cc, **{self.target: model})
+        if model:
+            seed = self.prompt_seed(index)
+            stem = Path(model.replace("\\", "/")).stem[:40]
+            cc = dict(self.cc, **{self.target: model,
+                                  "filename_prefix": f"{self.cc.get('filename_prefix') or 'pds'}_{index:03d}_{stem}"})
+        else:
+            seed = self._seed()
+            if self.plan and 1 <= index <= len(self.plan):
+                model = self.plan[index - 1]
+                cc = dict(self.cc, **{self.target: model})
         wf, what = build_workflow(cc, prose, tags, seed, size, self.template)
         if model:
             what += f", model {model}"
+        t0 = time.monotonic()
         pid = queue_prompt(self.cc, wf, self.client_id)
         self.sent += 1
-        info = {"prompt_id": pid, "seed": seed, "sent": what, "images": []}
+        info = {"prompt_id": pid, "seed": seed, "sent": what, "images": [], "model": model}
         log.info("[%d] ComfyUI: queued %s (seed %d, %s)", index, pid, seed, what)
+        urls: list[str] = []
         if self.cc.get("wait_for_images", True):
-            imgs = wait_for(self.cc, pid, self.stop_event)
+            timing: dict = {}
+            imgs = wait_for(self.cc, pid, self.stop_event, timing=timing)
+            wall = time.monotonic() - t0
             self.done += 1
             names = [i.get("filename", "?") for i in imgs]
             info["images"] = names
-            log.info("[%d] ComfyUI: finished -> %s", index, ", ".join(names) or "(no images reported)")
+            info["seconds"] = round(wall, 1)
+            urls = [f"{_base(self.cc)}/view?" + urllib.parse.urlencode(
+                {"filename": i.get("filename", ""), "subfolder": i.get("subfolder", ""), "type": i.get("type", "output")})
+                for i in imgs]
+            first_for_model = not any(t["model"] == model for t in self.timings)
+            self.timings.append({"index": index, "model": model, "wall": wall, "exec": timing.get("exec"),
+                                 "first": first_for_model})
+            ex = f", ComfyUI ran it in {timing['exec']:.1f}s" if timing.get("exec") is not None else ""
+            log.info("[%d] ComfyUI: finished in %.1fs%s%s -> %s", index, wall, ex,
+                     " (first image with this model: includes loading it)" if first_for_model else "",
+                     ", ".join(names) or "(no images reported)")
             if self.cc.get("download_images") and self.run_dir is not None:
                 for img in imgs:
                     try:
@@ -750,9 +849,80 @@ class ComfySender:
                         self.image_files.append(str(p))
                     except ComfyError as e:
                         log.warning("[%d] ComfyUI: could not download %s: %s", index, img.get("filename"), e)
+                        p = None
+                    if p is not None:
+                        info.setdefault("files", []).append(p.name)
+        if self.compare:
+            self.compare_rows.append({"index": index, "model": model, "seed": seed, "prompt": prose,
+                                      "files": info.get("files", []), "seconds": info.get("seconds"),
+                                      "urls": urls if self.cc.get("wait_for_images", True) else []})
         return info
 
+    def timing_report(self) -> list[str]:
+        """Summary lines: first image (model load) vs the rest, per model."""
+        if not self.timings:
+            return []
+        lines = []
+        models = list(dict.fromkeys(t["model"] for t in self.timings))
+        for m in models:
+            ts = [t for t in self.timings if t["model"] == m]
+            first = ts[0]["wall"]
+            rest = [t["wall"] for t in ts[1:]]
+            label = f"model {m}" if m else "images"
+            line = f"{label}: {len(ts)} image(s), first {first:.0f}s"
+            if rest:
+                avg = sum(rest) / len(rest)
+                line += f", the rest {avg:.0f}s on average"
+                if first > avg * 2 + 15:
+                    line += f" - loading the model cost about {first - avg:.0f}s"
+            lines.append(line)
+        return lines
+
+    def write_compare_page(self) -> Path | None:
+        """compare.html in the run folder: one row per prompt, one column per model."""
+        if not self.compare or not self.compare_rows or self.run_dir is None:
+            return None
+        import html as _h
+        prompts = list(dict.fromkeys(r["index"] for r in self.compare_rows))
+        cells = {(r["index"], r["model"]): r for r in self.compare_rows}
+        head = "".join(f"<th>{_h.escape(m)}</th>" for m in self.compare)
+        body = []
+        for i in prompts:
+            any_row = next(r for r in self.compare_rows if r["index"] == i)
+            tds = []
+            for m in self.compare:
+                r = cells.get((i, m))
+                if not r:
+                    tds.append("<td class=miss>not rendered</td>")
+                    continue
+                srcs = [f"images/{f}" for f in r["files"]] or r.get("urls") or []   # local copy, else from ComfyUI
+                imgs = "".join(f'<a href="{_h.escape(u)}"><img src="{_h.escape(u)}" loading=lazy></a>'
+                               for u in srcs) or "<div class=miss>no image</div>"
+                tm = f"{r['seconds']:.0f}s" if r.get("seconds") is not None else ""
+                tds.append(f"<td>{imgs}<div class=meta>{tm}</div></td>")
+            body.append(f"<tr><th class=p><b>Prompt {i}</b> &middot; seed {any_row['seed']}"
+                        f"<details><summary>prompt text</summary><pre>{_h.escape(any_row['prompt'])}</pre></details></th>"
+                        + "".join(tds) + "</tr>")
+        page = f"""<!DOCTYPE html><html><head><meta charset=utf-8><title>Model comparison</title><style>
+body{{font:14px system-ui,sans-serif;background:#1b1b1d;color:#ddd;margin:16px}}
+table{{border-collapse:collapse}}td,th{{border:1px solid #333;padding:6px;vertical-align:top}}
+thead th{{position:sticky;top:0;background:#26262a;font-weight:600;max-width:340px;word-break:break-all}}
+th.p{{text-align:left;width:220px;font-weight:400}}img{{max-width:340px;max-height:420px;display:block}}
+pre{{white-space:pre-wrap;font-size:12px;max-width:220px}}.meta{{color:#888;font-size:12px}}.miss{{color:#a66}}
+</style></head><body><h2>Model comparison</h2><p>Same prompt and seed on every model. Click an image for full size. Images that weren't downloaded load from ComfyUI, so it has to be running.</p>
+<table><thead><tr><th></th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></body></html>"""
+        out = self.run_dir / "compare.html"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(page, encoding="utf-8")
+        return out
+
     def finish(self) -> None:
+        try:
+            page = self.write_compare_page()
+            if page:
+                log.info("ComfyUI: model comparison page -> %s", page)
+        except OSError as e:
+            log.warning("ComfyUI: could not write the comparison page: %s", e)
         if self.cc.get("free_vram_after") and self.sent and (self.cc.get("wait_for_images", True)):
             try:
                 free_vram(self.cc)

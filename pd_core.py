@@ -1,3 +1,5 @@
+# PromptDirector Studio - Copyright (c) 2026 whitevamp
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0 (see LICENSE)
 """
 pd_core.py — shared engine for promptdirector (CLI) and promptdirector_gui (GUI).
 
@@ -32,7 +34,7 @@ from typing import Any, Callable
 import pd_comfy as comfy
 import pd_llamaserver as lserver
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 APP_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("promptdirector")
@@ -97,6 +99,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "top_p": 0.95,
         "max_tokens": 1500,
         "keep_alive": "10m",     # ollama only
+        # Reasoning ("thinking") models such as Qwen3 / DeepSeek-R1:
+        #   off  = ask the model to answer directly (recommended: thinking can use up the token budget)
+        #   on   = let it think first (raise Max tokens a lot)
+        #   auto = don't tell the server anything
+        "thinking": "off",
     },
     "generation": {
         "count": 5,
@@ -498,6 +505,14 @@ def validate_config(cfg: dict) -> dict:
             cc[k] = typ(cc[k] or 0)
         except (TypeError, ValueError):
             errs.append(f"comfy.{k} must be a number")
+    cc["compare_models"] = bool(cc.get("compare_models", False))
+    try:
+        cc["vram_wait"] = max(0.0, float(cc.get("vram_wait", 30) or 0))
+    except (TypeError, ValueError):
+        errs.append("comfy.vram_wait must be a number")
+    if cc["enabled"] and cc["compare_models"] and cc.get("rotation", "off") == "off":
+        errs.append("ComfyUI: 'Compare models' needs 'Rotate models' set to random or list "
+                    "(those are the models every prompt is rendered on)")
     if cc["enabled"] and cc["workflow"] == "custom" and not cc["workflow_file"]:
         errs.append("ComfyUI: the custom workflow needs a workflow file (ComfyUI: Workflow > Export (API))")
     if not cc["enabled"]:
@@ -515,6 +530,8 @@ def validate_config(cfg: dict) -> dict:
         o["formats"] = [o["formats"]]
     if not o["formats"] or any(f not in VALID_FORMATS for f in o["formats"]):
         errs.append(f"output.formats must be a non-empty list from {VALID_FORMATS}")
+    if m.get("thinking", "off") not in ("off", "on", "auto"):
+        errs.append("model.thinking must be off, on or auto")
     if b["type"] == "llamacpp_python" and not m["path"]:
         errs.append("model.path (.gguf file) is required for backend 'llamacpp_python'")
     if b["type"] == "ollama" and not m["name"]:
@@ -773,9 +790,23 @@ class OllamaBackend(BaseBackend):
             options["seed"] = seed
         payload = {"model": self.m["name"], "messages": messages, "stream": False,
                    "options": options, "keep_alive": self.m["keep_alive"]}
+        think = self.m.get("thinking", "off")
+        if think in ("off", "on"):
+            payload["think"] = think == "on"
         t0 = time.monotonic()
-        data = self._request("POST", f"{self.b['host']}/api/chat", payload)
-        text = (data.get("message") or {}).get("content", "")
+        try:
+            data = self._request("POST", f"{self.b['host']}/api/chat", payload)
+        except BackendError as e:
+            if "think" in payload and "think" in str(e).lower() and "not support" in str(e).lower():
+                payload.pop("think")              # older Ollama or a model without thinking support
+                data = self._request("POST", f"{self.b['host']}/api/chat", payload)
+            else:
+                raise
+        msg = data.get("message") or {}
+        text = msg.get("content", "") or ""
+        if not text.strip() and (msg.get("thinking") or "").strip():
+            log.warning("The model spent its whole token budget thinking and gave no answer. Set Thinking to 'off' "
+                        "(Backend & Model tab) or raise Max tokens.")
         return LLMResult(text, data.get("prompt_eval_count"), data.get("eval_count"), time.monotonic() - t0)
 
 
@@ -836,6 +867,9 @@ class OpenAICompatBackend(BaseBackend):
                    "top_p": self.m["top_p"], "max_tokens": max_tokens or self.m["max_tokens"], "stream": False}
         if seed is not None:
             payload["seed"] = seed
+        think = self.m.get("thinking", "off")
+        if think in ("off", "on"):                # Qwen3-style templates (llama-server, vLLM) read this
+            payload["chat_template_kwargs"] = {"enable_thinking": think == "on"}
         t0 = time.monotonic()
         data = self._request("POST", f"{self.base}/chat/completions", payload)
         try:
@@ -843,7 +877,14 @@ class OpenAICompatBackend(BaseBackend):
         except (KeyError, IndexError, TypeError) as e:
             raise BackendError(f"Unexpected response: {trunc(json.dumps(data), 500)}") from e
         usage = data.get("usage") or {}
-        return LLMResult(msg.get("content") or "", usage.get("prompt_tokens"),
+        content = msg.get("content") or ""
+        if not re.sub(r"(?s)<think>.*?(</think>|$)", "", content).strip() and \
+                ((msg.get("reasoning_content") or "").strip() or "<think>" in content):
+            log.warning("The model spent its whole token budget thinking and gave no answer "
+                        "(%s tokens).%s", usage.get("completion_tokens", "?"),
+                        " Retrying with /no_think." if self.m.get("thinking", "off") == "off"
+                        else " Set Thinking to 'off' (Backend & Model tab) or raise Max tokens.")
+        return LLMResult(content, usage.get("prompt_tokens"),
                          usage.get("completion_tokens"), time.monotonic() - t0)
 
 
@@ -1018,7 +1059,7 @@ def build_comic_seed(cfg: dict, presets: dict, rng: random.Random, base: str | N
     for p in panels:
         pd = {}
         for k in per_keys:
-            if f.get(k):
+            if f.get(k) and not (use_random and rnd.get(k, False)):
                 pd[k] = f[k]
                 continue
             if not (use_random and rnd.get(k, False)):
@@ -1384,11 +1425,21 @@ def compat_conflicts(d: dict, n: int | None) -> int:
     return c
 
 
+def fixed_fields(cfg: dict, allow_random: bool = True) -> dict:
+    """Typed scene values that are actually used: a ticked Random box (with Random ON) wins over typed text."""
+    sc = cfg["scene"]
+    use_random = allow_random and sc["random_enabled"]
+    return {k: v for k, v in sc["fields"].items()
+            if v and not (use_random and sc["random"].get(k, False))}
+
+
 def build_details(cfg: dict, presets: dict, rng: random.Random, allow_random: bool = True) -> tuple[dict, dict]:
     sc = cfg["scene"]
-    f, rnd = sc["fields"], sc["random"]
+    rnd = sc["random"]
     use_random = allow_random and sc["random_enabled"]
     compat = cfg["generation"].get("compat_rules", True)
+    f = {k: "" for k in FIELD_KEYS}
+    f.update(fixed_fields(cfg, allow_random))            # random-ticked fields count as empty here
     details = {k: f[k] for k in FIELD_KEYS if f[k]}
     origin = {k: "user" for k in details}
 
@@ -1440,6 +1491,8 @@ def build_people(cfg: dict, presets: dict, rng: random.Random, n: int | None, us
         p = {}
         for k in PERSON_KEYS:
             v = (slot.get(k) or "").strip()
+            if use_random and rnd.get(k):
+                v = ""                                   # ticked Random wins over typed text
             if not v and use_random and rnd.get(k) and k != "role":
                 pool = presets.get(k) or []
                 v = rng.choice(pool) if pool else ""
@@ -1805,6 +1858,7 @@ class JobResult:
     comfy_done: int = 0
     comfy_failed: int = 0
     image_files: list = field(default_factory=list)
+    retry_reasons: dict = field(default_factory=dict)   # rejected-attempt reason -> count
 
 
 def output_root(cfg: dict) -> Path:
@@ -1849,7 +1903,7 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
     log.info("Count: %d | seed mode: %s | random: %s | content: %s | formats: %s", g["count"],
              "scene text" if fixed_scenes else g["seed_mode"], "on" if cfg["scene"]["random_enabled"] else "off",
              g["content_rating"], ",".join(o["formats"]))
-    filled = {k: v for k, v in cfg["scene"]["fields"].items() if v}
+    filled = fixed_fields(cfg)
     if comic_on(cfg):
         cm = cfg["comic"]
         log.info("Comic mode: %s grid, %s, %s format, location %s, bubbles %s | suggested image size %s",
@@ -1918,6 +1972,13 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
     log.info("LLM calls: %d | tokens: %d | LLM time: %.1fs | prompt phase: %.1fs%s | total: %.1fs",
              res.llm_calls, res.tokens, res.llm_seconds, res.wall_seconds,
              f" | image phase: {res.image_seconds:.1f}s" if res.image_seconds else "", res.total_seconds)
+    if res.retry_reasons:
+        n_rej = sum(res.retry_reasons.values())
+        log.info("Rejected attempts: %d (%s)", n_rej, ", ".join(
+            f"{v} {k}" for k, v in sorted(res.retry_reasons.items(), key=lambda kv: -kv[1])))
+    if sender is not None:
+        for line in sender.timing_report():
+            log.info("ComfyUI timing - %s", line)
     for f in res.files:
         log.info("Output: %s", f)
     if sender is not None:
@@ -1926,7 +1987,7 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
     return res
 
 
-def _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy) -> dict | None:
+def _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy, model=None) -> dict | None:
     """Send one prompt to ComfyUI (re-checking the content rule first)."""
     for txt in (best, tags or ""):
         cp = content_problem(txt, cfg) if txt else None
@@ -1939,7 +2000,7 @@ def _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy) -> dict
         w, h = comic["suggested_size"].split("x")
         size = (int(w), int(h))
     try:
-        info = sender.send(i, best, tags, size)
+        info = sender.send(i, best, tags, size, model=model)
         res.comfy_sent += 1
         if info.get("images") or not sender.cc.get("wait_for_images", True):
             res.comfy_done += 1 if info.get("images") else 0
@@ -1952,6 +2013,13 @@ def _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy) -> dict
         log.error("[%d] ComfyUI: %s", i, e)
         if on_comfy:
             on_comfy(i, {"error": str(e)})
+        return None
+
+
+def _safe_vram(cc: dict) -> float | None:
+    try:
+        return comfy.vram_free_gb(cc)
+    except comfy.ComfyError:
         return None
 
 
@@ -1983,14 +2051,27 @@ def _comfy_end_phase(cfg, backend, sender, pending, writer, stop_event, res, on_
         else:
             log.warning("%s keeps its model in VRAM; if ComfyUI runs out of memory, stop the LLM server first, "
                         "let the app manage llama-server (Backend & Model tab), or run ComfyUI on another GPU", t)
-    n = len(pending)
-    for k, (i, best, tags, seed_obj) in enumerate(pending, 1):
+        waited_log = False
+        if cc.get("vram_wait", 30) > 0:
+            before, after, waited = comfy.wait_for_vram(cc, cc["vram_wait"], stop_event)
+            if after is not None:
+                log.info("ComfyUI: %.1f GB VRAM free after waiting %.0fs for the LLM to release it%s", after, waited,
+                         f" (was {before:.1f} GB)" if before is not None and after - before > 0.2 else "")
+                waited_log = True
+        if not waited_log and (v := _safe_vram(cc)) is not None:
+            log.info("ComfyUI: %.1f GB VRAM free before the first image", v)
+    elif (v := _safe_vram(cc)) is not None:
+        log.info("ComfyUI: %.1f GB VRAM free before the first image", v)
+    # Compare mode: model by model (each model loads once), every prompt on each.
+    jobs = ([(m, p) for m in sender.compare for p in pending] if sender.compare else [(None, p) for p in pending])
+    n = len(jobs)
+    for k, (model, (i, best, tags, seed_obj)) in enumerate(jobs, 1):
         if stop_event.is_set():
-            log.warning("ComfyUI: stopped; %d prompt(s) not sent", n - k + 1)
+            log.warning("ComfyUI: stopped; %d image job(s) not sent", n - k + 1)
             break
         if on_progress:
-            on_progress(k - 1, n, f"ComfyUI {k}/{n} ...")
-        info = _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy)
+            on_progress(k - 1, n, f"ComfyUI {k}/{n} ..." + (f" ({Path(model).stem[:30]})" if model else ""))
+        info = _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy, model=model)
         if info and writer.save:
             with (writer.dir / "comfy_jobs.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps({"index": i, **info}, ensure_ascii=False) + "\n")
@@ -2052,6 +2133,7 @@ def _generate_loop(cfg, backend, system_prompt, scenes, writer, rng, stop_event,
                 raise
             except BackendError as e:
                 log.error("[%d/%d] attempt %d: %s", i, total, attempt, e)
+                res.retry_reasons["backend error"] = res.retry_reasons.get("backend error", 0) + 1
                 continue
             res.llm_calls += 1
             res.tokens += r.completion_tokens or 0
@@ -2063,6 +2145,7 @@ def _generate_loop(cfg, backend, system_prompt, scenes, writer, rng, stop_event,
             problems = validate_prompt(text, g["min_paragraphs"], cfg)
             if problems and problems[0].startswith("content rule"):
                 log.warning("[%d/%d] attempt %d rejected (%s); not saved", i, total, attempt, problems[0])
+                res.retry_reasons["content rule"] = res.retry_reasons.get("content rule", 0) + 1
                 continue                      # never kept, not even as a fallback
             if g["dedupe"] and text and fingerprint(text) in seen:
                 problems.append("duplicate of an earlier prompt")
@@ -2070,6 +2153,14 @@ def _generate_loop(cfg, backend, system_prompt, scenes, writer, rng, stop_event,
                 best, best_problems = text, []
                 break
             log.warning("[%d/%d] attempt %d rejected: %s", i, total, attempt, "; ".join(problems))
+            for pr in problems:
+                key = re.split(r" \(|:", pr, maxsplit=1)[0].strip()
+                res.retry_reasons[key] = res.retry_reasons.get(key, 0) + 1
+            if "empty response" in problems and cfg["model"].get("thinking", "off") == "off" \
+                    and "/no_think" not in messages[-1]["content"]:
+                # Qwen3-style soft switch: some fine-tunes ignore enable_thinking but honor this.
+                messages = [messages[0], {"role": "user", "content": messages[-1]["content"] + "\n\n/no_think"}]
+                log.info("[%d/%d] empty answer: retrying with /no_think added", i, total)
             if text and (best is None or len(problems) < len(best_problems)):
                 best, best_problems = text, problems
         if not best:
@@ -2100,8 +2191,11 @@ def _generate_loop(cfg, backend, system_prompt, scenes, writer, rng, stop_event,
         }
         if sender is not None:
             if cfg["comfy"]["send_mode"] == "each":
-                info = _comfy_send_one(cfg, sender, i, best, tags, seed, res, on_comfy)
-                record["comfy"] = info
+                if sender.compare:
+                    record["comfy"] = [_comfy_send_one(cfg, sender, i, best, tags, seed, res, on_comfy, model=m)
+                                       for m in sender.compare if not stop_event.is_set()]
+                else:
+                    record["comfy"] = _comfy_send_one(cfg, sender, i, best, tags, seed, res, on_comfy)
             else:
                 pending.append((i, best, tags, seed))
         writer.write(i, best, record)

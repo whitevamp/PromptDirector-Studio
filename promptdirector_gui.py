@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# PromptDirector Studio - Copyright (c) 2026 whitevamp
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0 (see LICENSE)
 """
 promptdirector_gui.py — CustomTkinter front end for pd_core.
 
@@ -486,6 +488,7 @@ class App(ctk.CTk):
         e.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(box, text="...", width=28, command=lambda: self.open_picker(
             var, title, lambda: [(x, x) for x in items_fn()], clear_label="Clear")).grid(row=0, column=1, padx=(3, 0))
+        box.entry = e
         return box
 
     def _field_choices(self, key: str) -> list[str]:
@@ -577,9 +580,9 @@ class App(ctk.CTk):
                           ("Clear all fields", self.clear_fields)):
             ctk.CTkButton(btns, text=text, width=130, command=cmd).pack(side="left", padx=6)
 
-        ctk.CTkLabel(tab, text=("Type a value (or pick one from the list) to use it for every prompt. "
-                                "Leave a field empty to have it randomized per prompt (if its 'random' box is ticked "
-                                "and Random is ON) or chosen by the LLM. 'Roll' fills a random value now."),
+        ctk.CTkLabel(tab, text=("'Random' ticked (and Random ON): a new random value every prompt; any text in the box is "
+                                "ignored (shown greyed out). 'Random' unticked: the box's value is used for every prompt; "
+                                "an empty box is left for the LLM. 'Roll' picks a value now and unticks 'Random'."),
                      text_color=MUTED, wraplength=1100, justify="left", anchor="w").pack(fill="x", padx=6)
 
         f = ctk.CTkScrollableFrame(tab)
@@ -610,6 +613,11 @@ class App(ctk.CTk):
             ctk.CTkButton(f, text="Clear", width=50, fg_color="gray40",
                           command=lambda v=var: v.set("")).grid(row=r, column=4, padx=(2, 8))
         self._build_people_section(f, len(core.SCENE_FIELDS) + 1)
+        for (sect, _key), (var, _kind) in list(self.vars.items()):
+            if sect in ("scene.random", "scene.random_people"):
+                var.trace_add("write", self._update_ignored_text)
+        self.random_master.trace_add("write", self._update_ignored_text)
+        self._update_ignored_text()
 
         box = ctk.CTkFrame(tab)
         box.pack(fill="x", pady=(4, 0))
@@ -667,10 +675,35 @@ class App(ctk.CTk):
             for w in widgets:
                 (w.grid if i < n else w.grid_remove)()
         self.people_note.configure(text=(
-            f"Describe each of the {n} character(s). Empty boxes are random (if 'random' is ticked) or chosen by "
-            f"the LLM. Ages must be 18+ (e.g. 30 or early 30s). Filled-in roles build the Subject line."
+            f"Describe each of the {n} character(s). A ticked 'random' column is random for everyone (typed text is "
+            f"ignored); unticked columns use what you typed, and empty boxes are left for the LLM. "
+            f"Ages must be 18+ (e.g. 30 or early 30s). Typed roles build the Subject line."
             if n else "Set 'Number of characters' above (1-6) to describe each person here. With a random count, "
                       "ticked 'random' columns are still filled in for every character."))
+
+    TEXT_ON = ("gray10", "#DCE4EE")
+    TEXT_IGNORED = ("gray60", "gray40")
+
+    def _update_ignored_text(self, *_):
+        """Grey out typed values that a ticked 'Random' box overrides."""
+        if not hasattr(self, "random_master"):
+            return
+        master = bool(self.random_master.get())
+        for key, w in getattr(self, "field_widgets", {}).items():
+            rv = self.vars.get(("scene.random", key))
+            ignored = master and rv is not None and bool(rv[0].get())
+            target = getattr(w, "entry", w)
+            try:
+                target.configure(text_color=self.TEXT_IGNORED if ignored else self.TEXT_ON)
+            except Exception:
+                pass
+        for widgets in getattr(self, "people_rows", []):
+            for (k, _), w in zip(core.PERSON_FIELDS, widgets[1:]):
+                ignored = master and bool(self.vars[("scene.random_people", k)][0].get())
+                try:
+                    getattr(w, "entry", w).configure(text_color=self.TEXT_IGNORED if ignored else self.TEXT_ON)
+                except Exception:
+                    pass
 
     def refresh_field_choices(self):
         pass                                   # pickers read self.presets each time they open
@@ -682,6 +715,8 @@ class App(ctk.CTk):
     def roll_one(self, key: str):
         var = self.vars[("scene.fields", key)][0]
         var.set(core.roll_field(key, self.presets, self.rng, self._n_chars()))
+        if ("scene.random", key) in self.vars:
+            self.vars[("scene.random", key)][0].set(False)     # rolled = use this value
 
     def roll_all(self):
         for key, _, _, can_random in core.SCENE_FIELDS:
@@ -693,6 +728,7 @@ class App(ctk.CTk):
                 pool = self.presets.get(k) or (self.presets.get("subject") if k == "role" else [])
                 if not var.get().strip() and pool:
                     var.set(self.rng.choice(pool))
+                    self.vars[("scene.random_people", k)][0].set(False)
 
     def clear_fields(self):
         for key in core.FIELD_KEYS:
@@ -815,6 +851,8 @@ class App(ctk.CTk):
         self.row(f, "Wait for images", "comfy", "wait_for_images", bool, hint="OFF = just queue them in ComfyUI")
         self.row(f, "Download images", "comfy", "download_images", bool, hint="copy them into the run folder/images")
         self.row(f, "Free ComfyUI VRAM when done", "comfy", "free_vram_after", bool)
+        self.row(f, "Wait for LLM VRAM release (s)", "comfy", "vram_wait", float,
+                 hint="after unloading the LLM, wait until the memory is really free (0 = don't wait)")
         self.row(f, "Timeout per image (s)", "comfy", "timeout", float)
         self._apply_comfy_cache(core.comfy.load_model_cache(self.cfg["comfy"], core.APP_DIR))
 
@@ -825,7 +863,10 @@ class App(ctk.CTk):
         self.row(f, "Model type to rotate", "comfy", "rotation_target", choices=core.comfy.ROTATION_TARGETS,
                  hint="auto = from the workflow (diffusion model for Krea 2/FLUX, checkpoint for SDXL)")
         self.row(f, "Random: number of models", "comfy", "rotation_count", int,
-                 hint="must be <= number of prompts; consecutive prompts share a model")
+                 hint="must be <= number of prompts (no limit when comparing); consecutive prompts share a model")
+        self.row(f, "Compare models (same prompt on each)", "comfy", "compare_models", bool,
+                 hint="ON = every prompt is rendered on EVERY model above, same seed; set Prompts to 1 for a "
+                      "test bed. Makes compare.html in the run folder")
         r = f._row
         ctk.CTkLabel(f, text="List: models in order", anchor="w").grid(row=r, column=0, sticky="nw", **PAD)
         self.rot_text = ctk.CTkTextbox(f, height=90)
@@ -1325,9 +1366,10 @@ class App(ctk.CTk):
 
         self.section_label(f, "Model")
         self.model_entry = self.row(f, "Model name", "model", "name",
-                                    pick=lambda: [(m, m) for m in self._ollama_models],
+                                    pick=lambda: ([(m, m) for m in self._ollama_models] if self._ollama_models
+                                                  else self._list_models_sync()),
                                     pick_kw={"refresh": self._list_models_sync},
-                                    hint="Ollama tag or server model id (Choose... > Refresh lists them)")
+                                    hint="Ollama tag or server model id - Choose... lists them")
         self.gguf_entry = self.row(f, "Model file (.gguf)", "model", "path", pick=self._gguf_items,
                                    pick_kw={"refresh": self._gguf_items, "browse": "gguf"},
                                    hint="managed llama-server / llamacpp_python")
@@ -1337,10 +1379,13 @@ class App(ctk.CTk):
         self.row(f, "Top-p", "model", "top_p", float)
         self.row(f, "Max tokens", "model", "max_tokens", int, hint="per prompt")
         self.row(f, "Keep alive", "model", "keep_alive", hint="ollama only, e.g. 10m")
+        self.row(f, "Thinking (reasoning models)", "model", "thinking", choices=("off", "on", "auto"),
+                 hint="Qwen3 / DeepSeek-R1 etc.: off = answer directly (recommended); on needs a much larger Max tokens")
 
         bar = ctk.CTkFrame(f, fg_color="transparent")
         bar.grid(row=f._row, column=0, columnspan=4, sticky="w", padx=8, pady=12)
         ctk.CTkButton(bar, text="Test connection", command=self.test_connection).pack(side="left")
+        ctk.CTkButton(bar, text="Refresh model list", command=self.refresh_models).pack(side="left", padx=8)
         self._build_server_section(f)
         self.test_label = ctk.CTkLabel(bar, text="", wraplength=700, justify="left")
         self.test_label.pack(side="left", padx=12)

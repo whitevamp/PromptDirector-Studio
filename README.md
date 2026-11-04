@@ -1,4 +1,6 @@
-# PromptDirector Studio v2.7
+# PromptDirector Studio v2.8.0
+
+by **whitevamp**, licensed under CC BY-NC-SA 4.0 (free for non-commercial use; see [License](#license)).
 
 Generates character-centric image prompts with a local LLM, following `system_prompt.txt`.
 It has a GUI (CustomTkinter) and a CLI, which share the same engine and config file.
@@ -47,13 +49,16 @@ The fields are style, number of characters, subject, action, camera angle, shot/
 
 | Field state | Result |
 |---|---|
-| You typed a value | Used in **every** prompt, and the LLM is told it must not change it |
-| Empty, its *random* box ticked, and the master **Random ON** switch on | A new random value for each prompt, taken from the presets |
-| Empty, and random is off (for that field or overall) | Left out, so the LLM picks what fits the scene |
+| **Random** ticked, and the master **Random ON** switch on | a new random value from the presets for every prompt. Any text in the box is **ignored** and shown greyed out |
+| **Random** unticked, with text in the box | that value is used for **every** prompt, and the LLM is told not to change it |
+| **Random** unticked, box empty | left out, so the LLM picks what fits the scene |
+| Master **Random OFF** | every typed value is used; empty boxes are left to the LLM |
+
+**Roll** picks a value now and unticks Random for that field, so the rolled value is used. The same rules apply to every column in the Characters table and to the per-panel picks in comic mode.
 
 Lighting and composition are not random by default, so the LLM can match them to the scene (the file's "NO FIXED STYLE" rule).
 If there are 3 or more characters, random shots never pick close-ups.
-Free-text scene ideas (in the GUI box, or with `--scene` on the CLI) are combined with the fields you filled in; random fields are not added to them.
+Free-text scene ideas (in the GUI box, or with `--scene` on the CLI) are combined with your fixed fields; random fields are not added to them.
 
 ## Target image models
 
@@ -153,7 +158,8 @@ ComfyUI tab > **Model rotation**:
 |---|---|
 | Rotate models | `off`, `random` (N different models from the cached list) or `list` (the models you add, in order) |
 | Model type to rotate | `auto` picks from the workflow: the diffusion model for Krea 2/FLUX, the checkpoint for SDXL |
-| Random: number of models | must be no more than the number of prompts |
+| Random: number of models | must be no more than the number of prompts (no limit when comparing) |
+| Compare models | ON = every prompt is rendered on **every** model above (see below) |
 | List | one model per line; **Add model...** opens the picker |
 | Only compatible models | only uses models with the same architecture as the workflow's own model |
 | Model search folders | where your model files live (separated by `;`), so they can be checked |
@@ -163,7 +169,36 @@ ComfyUI tab > **Model rotation**:
   - Random mode only picks compatible models.
   - List mode skips incompatible models with a warning.
 - **Check models** shows the verdicts and the exact plan before you run. The plan is also written to the log at the start of each run.
-- CLI: `--rotate-random N`, `--rotate-models A B C`, `--any-model`, `--model-dirs "/path/one;/path/two"`.
+- CLI: `--rotate-random N`, `--rotate-models A B C`, `--any-model`, `--compare-models`, `--model-dirs "/path/one;/path/two"`.
+
+### Compare models (one prompt, many models)
+
+Turn on **Compare models** to use a prompt as a test bed. Instead of spreading the prompts across the models, every prompt is rendered on *every* model in the rotation (the random N or your list), with the **same seed**, so the model is the only thing that changes.
+
+- Set **Prompts** to 1 for a pure side-by-side. With more prompts, each one goes to each model: 3 prompts x 4 models = 12 images.
+- With send mode `end`, it works model by model, so each model loads only once.
+- Image files are named `pds_<prompt>_<model>_…`, and the run folder gets a **compare.html**: one row per prompt, one column per model, with the seed and the prompt text. Turn on **Download images** to keep copies in the run folder; otherwise the page loads them from ComfyUI.
+
+### Image timing
+
+The log now shows where the image time goes:
+- **Per image:** `[3] ComfyUI: finished in 58.2s, ComfyUI ran it in 55.9s`. The first image on each model is marked, since it includes loading the model.
+- **At the end:** one line per model, e.g. `first 412s, the rest 58s on average - loading the model cost about 354s`. A first image much slower than the rest means the time is going into loading (disk or VRAM); even times mean it's the workflow itself (steps, resolution, model).
+- **VRAM wait:** after unloading the LLM, the app waits until ComfyUI reports the memory as free (up to **Wait for LLM VRAM release**, 30 s by default) and logs how much is free. Starting ComfyUI too early can push it into its slow low-VRAM mode.
+- **Rejected attempts:** the summary counts why LLM drafts were rejected, e.g. `Rejected attempts: 8 (5 empty response, 3 too short)`.
+
+## Thinking models (Qwen3, DeepSeek-R1 and similar)
+
+Reasoning models write a hidden "thinking" section before the answer. If that uses up the token budget, the reply comes back empty: Test connection shows `replied in …s: ''` and runs end as FAILED.
+The **Thinking** setting (Backend & Model tab, `[model] thinking` in config.toml) controls this:
+
+- `off` (default): asks the server to skip thinking. Ollama gets `think: false`; llama-server and other OpenAI-style servers get `enable_thinking: false`.
+- `on`: lets the model think. You'll need a much higher **Max tokens** (4000+).
+- `auto`: sends nothing and leaves it to the model's default.
+
+When the app manages llama-server, it also adds `--jinja` (so the model's own chat template reads the thinking switch) and, with Thinking `off`, `--reasoning-budget 0`. Each flag is added only if your llama.cpp build supports it, and never when you've set it yourself in Extra args.
+
+If a model still gives an empty answer with Thinking `off`, the app retries that prompt with `/no_think` added. That's the Qwen3 soft switch, which some fine-tunes obey even when they ignore the template setting. The Log tab says when this happens.
 
 ## Quality checks
 
@@ -197,7 +232,7 @@ CLI: `--person "role=a knight;age=30;hair_color=black;clothing=plate armor"`, re
 - **Scene**: fields, per-field *random* boxes, 🎲 (roll a value now), ✕ (clear), master Random switch, free-text ideas
 - **Results**: prompts appear as they are made; Copy all; Open output folder
 - **Log**: live log, with warnings and errors colored
-- **Backend & Model**: backend type, host, API key, model (Refresh list), .gguf path, sampling settings, Test connection
+- **Backend & Model**: backend type, host, API key, model (**Choose…** opens a searchable list that loads by itself; **Refresh model list** re-reads it from the server), Thinking, .gguf path, sampling settings, Test connection
 - **Generation**: seed mode, SFW, random seed, system prompt and presets files, quality checks
 - **Output & Logging**: output folder, formats, log folder, debug log on/off
 - **Presets**: edit any random list (repeat a line to make it more likely)
@@ -233,3 +268,16 @@ Each run is saved to `<output>/prompts_YYYYmmdd_HHMMSS/` in any of these formats
 
 Prompts are written as soon as each one is made, so stopping a run never loses work.
 Logs go to `<output>/logs/`. The main log is always written. The debug log is a separate file with full requests and responses, turned on with `--debug` or the GUI switch.
+
+## License
+
+Copyright (c) 2026 whitevamp.
+
+PromptDirector Studio is licensed under **Creative Commons Attribution-NonCommercial-ShareAlike 4.0** ([CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)). See `LICENSE`.
+
+- **You may** use, copy, modify and share it.
+- **You must** credit whitevamp as the original author, link to the license and say what you changed.
+- **Non-commercial only:** no selling it, and no using it or parts of it for commercial purposes.
+- **Share-alike:** modified versions must be released under the same license.
+
+CustomTkinter (MIT) is installed separately. Models, LoRAs, ComfyUI and workflows used with this software keep their own licenses.

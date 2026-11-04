@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# PromptDirector Studio - Copyright (c) 2026 whitevamp
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0 (see LICENSE)
 """
 pd_gui_bench.py — measures why CustomTkinter widgets are slow to create on this machine.
 

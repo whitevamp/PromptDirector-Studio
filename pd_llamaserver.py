@@ -1,3 +1,5 @@
+# PromptDirector Studio - Copyright (c) 2026 whitevamp
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0 (see LICENSE)
 """
 pd_llamaserver.py — let the app start and stop llama.cpp's llama-server itself.
 
@@ -84,7 +86,23 @@ def list_ggufs(gguf_dir: str) -> list[str]:
     return sorted(out, key=lambda s: Path(s).name.lower())
 
 
-def build_command(binary: Path, sc: dict, model_path: str, n_ctx: int, host: str, port: int) -> list[str]:
+_HELP_CACHE: dict[str, str] = {}
+
+
+def server_help(binary: Path) -> str:
+    """llama-server --help text (cached), used to add newer flags only when this build has them."""
+    key = str(binary)
+    if key not in _HELP_CACHE:
+        try:
+            r = subprocess.run([key, "--help"], capture_output=True, text=True, timeout=20)
+            _HELP_CACHE[key] = (r.stdout or "") + (r.stderr or "")
+        except Exception:
+            _HELP_CACHE[key] = ""
+    return _HELP_CACHE[key]
+
+
+def build_command(binary: Path, sc: dict, model_path: str, n_ctx: int, host: str, port: int,
+                  thinking: str = "off") -> list[str]:
     cmd = [str(binary), "-m", str(Path(model_path).expanduser()), "-c", str(int(n_ctx)),
            "-ngl", str(int(sc.get("n_gpu_layers", 99))), "-np", str(max(1, int(sc.get("parallel") or 1))),
            "--host", host, "--port", str(port)]
@@ -92,9 +110,16 @@ def build_command(binary: Path, sc: dict, model_path: str, n_ctx: int, host: str
         cmd += ["-fa", str(sc["flash_attn"])]
     if sc.get("cache_type"):
         cmd += ["-ctk", sc["cache_type"], "-ctv", sc["cache_type"]]
-    if sc.get("extra_args"):
-        cmd += shlex.split(sc["extra_args"])
-    return cmd
+    extra = shlex.split(sc["extra_args"]) if sc.get("extra_args") else []
+    help_text = server_help(binary)
+    # --jinja makes the server use the model's own chat template, which is what reads enable_thinking.
+    if "--jinja" in help_text and not {"--jinja", "--no-jinja"} & set(extra):
+        cmd += ["--jinja"]
+    # Thinking off: also cap reasoning at the server, so a model that ignores enable_thinking can't
+    # spend the whole token budget thinking and return an empty answer.
+    if thinking == "off" and "--reasoning-budget" in help_text and "--reasoning-budget" not in extra:
+        cmd += ["--reasoning-budget", "0"]
+    return cmd + extra
 
 
 def _get(url: str, timeout: float = 3.0) -> tuple[int, dict]:
@@ -152,7 +177,8 @@ class LlamaServerManager:
         if host not in ("127.0.0.1", "localhost", "0.0.0.0", "::1"):
             raise ServerError(f"A managed llama-server must run on this machine, but the host is {b['host']}")
         binary = find_binary(sc.get("llama_cpp_dir", ""))
-        cmd = build_command(binary, sc, m["path"], m["n_ctx"], "127.0.0.1" if host == "localhost" else host, port)
+        cmd = build_command(binary, sc, m["path"], m["n_ctx"], "127.0.0.1" if host == "localhost" else host, port,
+                            m.get("thinking", "off"))
         with self._lock:
             if self.running() and self.cmd == cmd:
                 return f"llama-server already running with {Path(m['path']).name}"

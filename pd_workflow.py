@@ -1,3 +1,5 @@
+# PromptDirector Studio - Copyright (c) 2026 whitevamp
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0 (see LICENSE)
 """
 pd_workflow.py — inspect and edit a ComfyUI API-format workflow (the file from Workflow > Export (API)).
 

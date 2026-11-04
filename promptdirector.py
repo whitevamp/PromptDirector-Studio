@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# PromptDirector Studio - Copyright (c) 2026 whitevamp
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0 (see LICENSE)
 """
 promptdirector.py — command-line front end. The GUI is promptdirector_gui.py.
 Both use pd_core.py, and both read/write the same config.toml.
@@ -95,6 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--rotate-random", type=int, metavar="N", help="use N different random compatible models")
     g.add_argument("--rotate-models", nargs="+", metavar="MODEL", help="use these models in turn (grouped)")
     g.add_argument("--any-model", action="store_true", help="rotation: don't limit to compatible models")
+    g.add_argument("--compare-models", action="store_true",
+                   help="render every prompt on EVERY rotation model (same seed) and write compare.html")
     g.add_argument("--model-dirs", help="folders (separated by ;) where model files live, for the check")
     g.add_argument("--comfy-test", action="store_true", help="test the ComfyUI connection and exit")
 
@@ -128,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--dry-run", action="store_true", help="show scene seeds only, no LLM")
     g.add_argument("--show-config", action="store_true")
     g.add_argument("--export-presets", metavar="PATH", help="write the built-in presets to a JSON file and exit")
-    p.add_argument("--version", action="version", version=f"%(prog)s {core.__version__}")
+    p.add_argument("--version", action="version", version=f"PromptDirector Studio {core.__version__} - by whitevamp - CC BY-NC-SA 4.0 (non-commercial)")
     return p
 
 
@@ -188,6 +192,8 @@ def apply_cli(cfg: dict, a: argparse.Namespace) -> dict:
         cc["rotation"], cc["rotation_models"] = "list", a.rotate_models
     if a.any_model:
         cc["rotation_compatible_only"] = False
+    if a.compare_models:
+        cc["compare_models"] = True
     if a.model_dirs:
         cc["model_search_dirs"] = a.model_dirs
     cm = cfg.setdefault("comic", dict(core.DEFAULT_CONFIG["comic"]))
