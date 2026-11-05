@@ -749,8 +749,8 @@ def plan_rotation(cc: dict, n_jobs: int, lists: dict, template: dict | None,
             raise ComfyError(f"Model rotation: {len(models)} models but only {n_jobs} prompt(s) - "
                              "generate at least as many prompts as models")
     if compare:
-        return models, (f"Compare models ({mode}, {target.replace('_', ' ')}): every prompt is rendered on "
-                        f"{len(models)} model(s) with the same seed: " + ", ".join(models))
+        return models, (f"Compare models ({mode}, {target.replace('_', ' ')}): rendering on "
+                        f"{len(models)} model(s): " + ", ".join(models))
     base, extra = divmod(n_jobs, len(models))
     plan: list[str] = []
     parts = []
@@ -780,7 +780,8 @@ class ComfySender:
         self.compare: list[str] | None = None      # compare mode: every prompt goes to each of these
         self.target = rotation_target(cc, self.template)
         self.timings: list[dict] = []              # one per finished image job
-        self._prompt_seeds: dict[int, int] = {}
+        self._prompt_seeds: dict = {}
+        self.per_model = 1                         # compare mode: images per model (seed variations)
         self.compare_rows: list[dict] = []         # for compare.html
 
     def set_plan(self, n_jobs: int, lists: dict) -> str:
@@ -794,22 +795,38 @@ class ComfySender:
     def _seed(self) -> int:
         return int(self.cc.get("seed") or 0) or self.rng.randint(1, 2**48)
 
-    def prompt_seed(self, index: int) -> int:
-        """One seed per prompt, shared by every model in compare mode (a fair comparison)."""
-        if index not in self._prompt_seeds:
-            self._prompt_seeds[index] = self._seed()
-        return self._prompt_seeds[index]
+    def set_compare_images(self, n_images: int) -> str:
+        """Compare mode: one prompt -> n_images, split evenly across the models (same seeds on each)."""
+        n_models = max(1, len(self.compare or []))
+        self.per_model = max(1, -(-n_images // n_models))          # ceil
+        total = self.per_model * n_models
+        note = f" (rounded up from {n_images} so every model gets the same seeds)" if total != n_images else ""
+        return (f"Compare models: the LLM writes 1 prompt; it is rendered {total} times{note} = "
+                f"{self.per_model} seed(s) x {n_models} model(s)")
+
+    def compare_jobs(self) -> list[tuple[str, int]]:
+        """(model, variant) pairs, model by model so each model loads once."""
+        return [(m, v) for m in (self.compare or []) for v in range(self.per_model)]
+
+    def prompt_seed(self, key) -> int:
+        """One seed per (prompt, variant), shared by every model in compare mode (a fair comparison)."""
+        if key not in self._prompt_seeds:
+            fixed = int(self.cc.get("seed") or 0)
+            v = key[1] if isinstance(key, tuple) else 0
+            self._prompt_seeds[key] = fixed + v if fixed else self.rng.randint(1, 2**48)
+        return self._prompt_seeds[key]
 
     def send(self, index: int, prose: str, tags: str | None, size: tuple[int, int] | None,
-             model: str | None = None) -> dict:
+             model: str | None = None, variant: int = 0) -> dict:
         """Queue one prompt; waits/downloads if configured. Returns info for the record.
         `model` (compare mode) renders this prompt on that model with the prompt's shared seed."""
         cc = self.cc
         if model:
-            seed = self.prompt_seed(index)
+            seed = self.prompt_seed((index, variant))
             stem = Path(model.replace("\\", "/")).stem[:40]
+            sv = f"_s{variant + 1:02d}" if self.per_model > 1 else ""
             cc = dict(self.cc, **{self.target: model,
-                                  "filename_prefix": f"{self.cc.get('filename_prefix') or 'pds'}_{index:03d}_{stem}"})
+                                  "filename_prefix": f"{self.cc.get('filename_prefix') or 'pds'}_{index:03d}{sv}_{stem}"})
         else:
             seed = self._seed()
             if self.plan and 1 <= index <= len(self.plan):
@@ -853,7 +870,7 @@ class ComfySender:
                     if p is not None:
                         info.setdefault("files", []).append(p.name)
         if self.compare:
-            self.compare_rows.append({"index": index, "model": model, "seed": seed, "prompt": prose,
+            self.compare_rows.append({"index": index, "variant": variant, "model": model, "seed": seed, "prompt": prose,
                                       "files": info.get("files", []), "seconds": info.get("seconds"),
                                       "urls": urls if self.cc.get("wait_for_images", True) else []})
         return info
@@ -883,34 +900,44 @@ class ComfySender:
         if not self.compare or not self.compare_rows or self.run_dir is None:
             return None
         import html as _h
-        prompts = list(dict.fromkeys(r["index"] for r in self.compare_rows))
-        cells = {(r["index"], r["model"]): r for r in self.compare_rows}
+        prompts = list(dict.fromkeys((r["index"], r.get("variant", 0)) for r in self.compare_rows))
+        cells = {(r["index"], r.get("variant", 0), r["model"]): r for r in self.compare_rows}
         head = "".join(f"<th>{_h.escape(m)}</th>" for m in self.compare)
         body = []
-        for i in prompts:
-            any_row = next(r for r in self.compare_rows if r["index"] == i)
-            tds = []
-            for m in self.compare:
-                r = cells.get((i, m))
-                if not r:
-                    tds.append("<td class=miss>not rendered</td>")
-                    continue
-                srcs = [f"images/{f}" for f in r["files"]] or r.get("urls") or []   # local copy, else from ComfyUI
-                imgs = "".join(f'<a href="{_h.escape(u)}"><img src="{_h.escape(u)}" loading=lazy></a>'
-                               for u in srcs) or "<div class=miss>no image</div>"
-                tm = f"{r['seconds']:.0f}s" if r.get("seconds") is not None else ""
-                tds.append(f"<td>{imgs}<div class=meta>{tm}</div></td>")
-            body.append(f"<tr><th class=p><b>Prompt {i}</b> &middot; seed {any_row['seed']}"
-                        f"<details><summary>prompt text</summary><pre>{_h.escape(any_row['prompt'])}</pre></details></th>"
-                        + "".join(tds) + "</tr>")
+
+        def cell(r):
+            if not r:
+                return "<td class=miss>not rendered</td>"
+            srcs = [f"images/{f}" for f in r["files"]] or r.get("urls") or []   # local copy, else from ComfyUI
+            imgs = "".join(f'<a href="{_h.escape(u)}"><img src="{_h.escape(u)}" loading=lazy></a>'
+                           for u in srcs) or "<div class=miss>no image</div>"
+            tm = f"{r['seconds']:.0f}s" if r.get("seconds") is not None else ""
+            return f"<td>{imgs}<div class=meta>seed {r['seed']} &middot; {tm}</div></td>"
+
+        texts = list(dict.fromkeys((r["index"], r["prompt"]) for r in self.compare_rows))
+        intro = "".join(f"<details{' open' if len(texts) == 1 else ''}><summary>Prompt {i}</summary>"
+                        f"<pre>{_h.escape(t)}</pre></details>" for i, t in texts)
+        if len(self.compare) == 1:
+            # one model: a gallery of the seed variations
+            m = self.compare[0]
+            tiles = [cell(cells.get((i, v, m))) for i, v in prompts]
+            rows = [tiles[k:k + 4] for k in range(0, len(tiles), 4)]
+            body = ["<tr>" + "".join(r) + "</tr>" for r in rows]
+            head = f"<th colspan=4>{_h.escape(m)}</th>"
+        else:
+            for i, v in prompts:
+                body.append(f"<tr><th class=p><b>Prompt {i}</b>"
+                            + (f" &middot; seed {v + 1}" if self.per_model > 1 else "") + "</th>"
+                            + "".join(cell(cells.get((i, v, m))) for m in self.compare) + "</tr>")
+            head = "<th></th>" + head
         page = f"""<!DOCTYPE html><html><head><meta charset=utf-8><title>Model comparison</title><style>
 body{{font:14px system-ui,sans-serif;background:#1b1b1d;color:#ddd;margin:16px}}
 table{{border-collapse:collapse}}td,th{{border:1px solid #333;padding:6px;vertical-align:top}}
 thead th{{position:sticky;top:0;background:#26262a;font-weight:600;max-width:340px;word-break:break-all}}
 th.p{{text-align:left;width:220px;font-weight:400}}img{{max-width:340px;max-height:420px;display:block}}
-pre{{white-space:pre-wrap;font-size:12px;max-width:220px}}.meta{{color:#888;font-size:12px}}.miss{{color:#a66}}
-</style></head><body><h2>Model comparison</h2><p>Same prompt and seed on every model. Click an image for full size. Images that weren't downloaded load from ComfyUI, so it has to be running.</p>
-<table><thead><tr><th></th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></body></html>"""
+pre{{white-space:pre-wrap;font-size:13px;max-width:900px}}.meta{{color:#888;font-size:12px}}.miss{{color:#a66}}
+</style></head><body><h2>Model comparison</h2><p>Same prompt, and the same seeds on every model. Click an image for full size. Images that weren't downloaded load from ComfyUI, so it has to be running.</p>
+{intro}<table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></body></html>"""
         out = self.run_dir / "compare.html"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(page, encoding="utf-8")

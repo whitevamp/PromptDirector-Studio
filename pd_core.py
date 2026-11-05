@@ -20,6 +20,7 @@ import logging
 import logging.handlers
 import os
 import random
+import math
 import re
 import sys
 import threading
@@ -34,7 +35,7 @@ from typing import Any, Callable
 import pd_comfy as comfy
 import pd_llamaserver as lserver
 
-__version__ = "2.8.2"
+__version__ = "2.9.1"
 
 APP_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("promptdirector")
@@ -113,6 +114,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_words": 0,                   # 0 = use the targets' default range
         "max_words": 0,
         "filler_check": True,             # re-ask when the prompt is padded with mood/interpretation
+        "detail_check": True,             # re-ask (with a correction) when ages/hair/camera/lighting... don't match
         "max_filler_hits": 2,
         "compat_rules": True,             # random picks avoid contradicting each other / your fields
         "tag_prefix": "masterpiece, best quality, amazing quality",   # put in front of Illustrious tags
@@ -1738,6 +1740,98 @@ def validate_prompt(text: str, min_paragraphs: int, cfg: dict | None = None) -> 
     return problems
 
 
+# ---- scene detail check: does the prompt actually use the details it was given? ----
+_DECADES = {"teens": 10, "twenties": 20, "thirties": 30, "forties": 40, "fifties": 50, "sixties": 60,
+            "seventies": 70, "eighties": 80, "nineties": 90}
+_AGE_RE = re.compile(
+    r"\b(?:(early|mid|late)[\s-]*)?(?:(\d)0'?s|(" + "|".join(_DECADES) + r"))\b"
+    r"|\b(\d{2})[\s-]*(?:years?|yrs?)[\s-]*old\b|\b(?:aged?|age)\s+(\d{2})\b", re.I)
+_STOP = {"and", "the", "with", "for", "from", "into", "onto", "its", "his", "her", "their", "of", "in", "on",
+         "at", "to", "a", "an", "or", "matching", "role", "view", "shot", "light", "lighting", "style"}
+_DETAIL_SCENE_KEYS = ("camera_angle", "shot", "lighting", "time_weather", "location")
+_DETAIL_PERSON_KEYS = ("hair_color", "hair_length", "ethnicity", "clothing")
+
+
+def _age_ranges(text: str) -> list[tuple[int, int, str]]:
+    """Every age mention in the text as (low, high, the words used)."""
+    out = []
+    for m in _AGE_RE.finditer(text):
+        part, dig, word, years, aged = m.groups()
+        if years or aged:
+            n = int(years or aged)
+            if 16 <= n <= 99:
+                out.append((n, n, m.group(0)))
+            continue
+        d = int(dig) * 10 if dig else _DECADES[word.lower()]
+        if d < 10:
+            continue
+        lo, hi = {"early": (d, d + 3), "mid": (d + 4, d + 6), "late": (d + 7, d + 9)}.get(
+            (part or "").lower(), (d, d + 9))
+        out.append((lo, hi, m.group(0)))
+    return out
+
+
+def _tokens(value: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", value.lower()) if len(t) >= 3 and t not in _STOP]
+
+
+def _has_words(value: str, text_words: set[str], share: float) -> bool | None:
+    """True if enough of value's words appear in the text (prefix match, so 'Latino' finds 'Latina').
+    None = too long or vague to check. 'A/B' values pass if either alternative is used."""
+    if "/" in value:
+        alts = [_has_words(a, text_words, share) for a in value.split("/") if a.strip()]
+        return None if all(x is None for x in alts) else any(alts)
+    toks = _tokens(value)
+    if not toks or len(toks) > 6:
+        return None
+    found = sum(any(w.startswith(t[:max(4, len(t) - 2)]) for w in text_words) for t in toks)
+    return found >= max(1, math.ceil(share * len(toks)))
+
+
+def detail_problems(text: str, details: dict | None) -> list[str]:
+    """Scene details that the prompt ignored or contradicted (ages, hair, clothing, camera, lighting...)."""
+    if not details:
+        return []
+    probs = []
+    people = details.get("people") or []
+    asked = [(p["age"], _age_ranges(p["age"])) for p in people if p.get("age")]
+    asked = [(a, r[0]) for a, r in asked if r]
+    if asked:
+        found = _age_ranges(text)
+        free = list(found)
+        missing = []
+        for a, (lo, hi, _) in asked:
+            hit = next((f for f in free if f[0] <= hi and f[1] >= lo), None)
+            if hit:
+                free.remove(hit)
+            else:
+                missing.append(a)
+        all_set = len(asked) == len(people)
+        wrong = [f[2] for f in free if not any(f[0] <= hi and f[1] >= lo for _, (lo, hi, _) in asked)] if all_set else []
+        if missing or wrong:
+            probs.append("ages don't match (asked for " + ", ".join(a for a, _ in asked) + "; prompt says "
+                         + (", ".join(f[2] for f in found) or "no ages") + ")")
+    words = set(re.findall(r"[a-z0-9]+", text.lower()))
+    for k in _DETAIL_SCENE_KEYS:
+        v = details.get(k)
+        if v and _has_words(v, words, 0.5) is False:
+            probs.append(f"{SEED_LABELS[k].lower()} '{v}' not used")
+    for i, p in enumerate(people, 1):
+        for k in _DETAIL_PERSON_KEYS:
+            v = p.get(k)
+            if v and _has_words(v, words, 0.5) is False:
+                probs.append(f"character {i} {k.replace('_', ' ')} '{v}' not used")
+    return probs
+
+
+def correction_message(probs: list[str]) -> str:
+    return ("Your prompt does not follow these required details from the scene description:\n"
+            + "\n".join(f"- {p}" for p in probs)
+            + "\nRewrite the whole prompt so it uses every listed detail exactly as given (each character's "
+              "stated age, hair, ethnicity and clothing; the camera angle, shot, lighting, location and time). "
+              "Keep everything else, the same structure and length. Output only the corrected prompt.")
+
+
 FILLER_RE = re.compile(
     r"\b(atmosphere|atmospheric|ambiance|ambience|a sense of|sense of (calm|wonder|intimacy|mystery|unity|scale|"
     r"tranquility|serenity|anticipation|connection)|evok\w+|poignant|dreamlike|dream-like|ethereal|"
@@ -1921,6 +2015,9 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
     res.main_log, res.debug_log = setup_logging(cfg, root, log_handlers, console_log)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     o, g = cfg["output"], cfg["generation"]
+    compare_images = 0
+    if cfg["comfy"]["enabled"] and cfg["comfy"].get("compare_models"):
+        compare_images, g["count"] = g["count"], 1      # compare: ONE prompt, 'count' = number of images
     run_dir = root / f"{o['filename_prefix']}_{run_id}" if o["timestamp_subfolder"] else root
     if o["timestamp_subfolder"]:
         n = 2
@@ -1934,7 +2031,8 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
     log.info("Backend: %s%s @ %s | model: %s", cfg["backend"]["type"], " (managed by the app)" if managed else "",
              cfg["backend"]["host"] or "(in-process)",
              cfg["model"]["path"] if cfg["backend"]["type"] == "llamacpp_python" or managed else cfg["model"]["name"])
-    log.info("Count: %d | seed mode: %s | random: %s | content: %s | formats: %s", g["count"],
+    log.info("Count: %s | seed mode: %s | random: %s | content: %s | formats: %s",
+             f"1 prompt -> {compare_images} images (Compare models)" if compare_images else g["count"],
              "scene text" if fixed_scenes else g["seed_mode"], "on" if cfg["scene"]["random_enabled"] else "off",
              g["content_rating"], ",".join(o["formats"]))
     filled = fixed_fields(cfg)
@@ -1945,9 +2043,9 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
                  suggested_size(cm["layout"]))
         if cm["format"] == "bbox" and "lines" in o["formats"]:
             log.info("Note: the 'lines' output format is skipped for BBOX specs (they need their line breaks)")
-    log.info("Targets: %s | length %d-%d words | filler check: %s | compat rules: %s",
+    log.info("Targets: %s | length %d-%d words | filler check: %s | detail check: %s | compat rules: %s",
              ", ".join(g["targets"]), *word_range(cfg), "on" if g["filler_check"] else "off",
-             "on" if g["compat_rules"] else "off")
+             "on" if g.get("detail_check", True) else "off", "on" if g["compat_rules"] else "off")
     log.info("Fixed fields: %s", ", ".join(f"{FIELD_LABELS[k]}={v!r}" for k, v in filled.items()) or "(none)")
     log.info("Log: %s%s", res.main_log, f" | debug log: {res.debug_log}" if res.debug_log else "")
     log.debug("Effective config: %s", json.dumps(redacted(cfg), indent=2))
@@ -1981,6 +2079,8 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
                 if cc["rotation"] != "off":
                     report = sender.set_plan(g["count"], comfy.load_model_cache(cc, APP_DIR).get("lists", {}))
                     log.info(report)
+                    if sender.compare:
+                        log.info(sender.set_compare_images(compare_images))
                 log.info("ComfyUI: %s | workflow %s | send %s | %s", comfy._base(cc), cc["workflow"],
                          "after all prompts" if cc["send_mode"] == "end" else "after each prompt",
                          "prompt files saved too" if cc["save_prompts"] else "prompt files NOT saved (ComfyUI only)")
@@ -2021,7 +2121,7 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
     return res
 
 
-def _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy, model=None) -> dict | None:
+def _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy, model=None, variant=0) -> dict | None:
     """Send one prompt to ComfyUI (re-checking the content rule first)."""
     for txt in (best, tags or ""):
         cp = content_problem(txt, cfg) if txt else None
@@ -2034,7 +2134,7 @@ def _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy, model=N
         w, h = comic["suggested_size"].split("x")
         size = (int(w), int(h))
     try:
-        info = sender.send(i, best, tags, size, model=model)
+        info = sender.send(i, best, tags, size, model=model, variant=variant)
         res.comfy_sent += 1
         if info.get("images") or not sender.cc.get("wait_for_images", True):
             res.comfy_done += 1 if info.get("images") else 0
@@ -2097,15 +2197,16 @@ def _comfy_end_phase(cfg, backend, sender, pending, writer, stop_event, res, on_
     elif (v := _safe_vram(cc)) is not None:
         log.info("ComfyUI: %.1f GB VRAM free before the first image", v)
     # Compare mode: model by model (each model loads once), every prompt on each.
-    jobs = ([(m, p) for m in sender.compare for p in pending] if sender.compare else [(None, p) for p in pending])
+    jobs = ([(m, v, p) for m, v in sender.compare_jobs() for p in pending] if sender.compare
+            else [(None, 0, p) for p in pending])
     n = len(jobs)
-    for k, (model, (i, best, tags, seed_obj)) in enumerate(jobs, 1):
+    for k, (model, variant, (i, best, tags, seed_obj)) in enumerate(jobs, 1):
         if stop_event.is_set():
             log.warning("ComfyUI: stopped; %d image job(s) not sent", n - k + 1)
             break
         if on_progress:
             on_progress(k - 1, n, f"ComfyUI {k}/{n} ..." + (f" ({Path(model).stem[:30]})" if model else ""))
-        info = _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy, model=model)
+        info = _comfy_send_one(cfg, sender, i, best, tags, seed_obj, res, on_comfy, model=model, variant=variant)
         if info and writer.save:
             with (writer.dir / "comfy_jobs.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps({"index": i, **info}, ensure_ascii=False) + "\n")
@@ -2155,7 +2256,9 @@ def _generate_loop(cfg, backend, system_prompt, scenes, writer, rng, stop_event,
         if on_progress:
             on_progress(i - 1, total, f"Generating {i}/{total} ...")
         messages = [{"role": "system", "content": system_prompt},
-                    {"role": "user", "content": g["user_template"].format(scene=seed.text)}]
+                    {"role": "user", "content": g["user_template"].format(scene=seed.text)
+                     + ("\n\nUse every listed detail exactly as given, including each character's stated age."
+                        if seed.details and seed.details.get("people") else "")}]
         best, best_problems, attempts = None, None, 0
         for attempt in range(1, g["max_attempts_per_prompt"] + 1):
             if stop_event.is_set():
@@ -2183,12 +2286,16 @@ def _generate_loop(cfg, backend, system_prompt, scenes, writer, rng, stop_event,
                 continue                      # never kept, not even as a fallback
             if g["dedupe"] and text and fingerprint(text) in seen:
                 problems.append("duplicate of an earlier prompt")
+            dprobs = (detail_problems(text, seed.details)
+                      if g.get("detail_check", True) and text and not comic_on(cfg) else [])
+            problems += dprobs
             if not problems:
                 best, best_problems = text, []
                 break
             log.warning("[%d/%d] attempt %d rejected: %s", i, total, attempt, "; ".join(problems))
             for pr in problems:
-                key = re.split(r" \(|:", pr, maxsplit=1)[0].strip()
+                key = ("scene detail not used" if pr.endswith("' not used")
+                       else re.split(r" \(|:", pr, maxsplit=1)[0].strip())
                 res.retry_reasons[key] = res.retry_reasons.get(key, 0) + 1
             if "empty response" in problems and cfg["model"].get("thinking", "off") == "off" \
                     and "/no_think" not in messages[-1]["content"]:
@@ -2197,6 +2304,13 @@ def _generate_loop(cfg, backend, system_prompt, scenes, writer, rng, stop_event,
                 log.info("[%d/%d] empty answer: retrying with /no_think added", i, total)
             if text and (best is None or len(problems) < len(best_problems)):
                 best, best_problems = text, problems
+            if dprobs and len(dprobs) == len(problems):
+                # only the details are off: show the model its draft and ask for a corrected version
+                messages = messages[:2] + [{"role": "assistant", "content": text},
+                                           {"role": "user", "content": correction_message(dprobs)}]
+                log.info("[%d/%d] asking the model to fix: %s", i, total, "; ".join(dprobs))
+            elif len(messages) > 2:
+                messages = messages[:2]           # other problems: start over from the scene
         if not best:
             if stop_event.is_set():
                 res.stopped = True
@@ -2226,8 +2340,8 @@ def _generate_loop(cfg, backend, system_prompt, scenes, writer, rng, stop_event,
         if sender is not None:
             if cfg["comfy"]["send_mode"] == "each":
                 if sender.compare:
-                    record["comfy"] = [_comfy_send_one(cfg, sender, i, best, tags, seed, res, on_comfy, model=m)
-                                       for m in sender.compare if not stop_event.is_set()]
+                    record["comfy"] = [_comfy_send_one(cfg, sender, i, best, tags, seed, res, on_comfy, model=m, variant=v)
+                                       for m, v in sender.compare_jobs() if not stop_event.is_set()]
                 else:
                     record["comfy"] = _comfy_send_one(cfg, sender, i, best, tags, seed, res, on_comfy)
             else:

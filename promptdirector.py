@@ -98,7 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--rotate-models", nargs="+", metavar="MODEL", help="use these models in turn (grouped)")
     g.add_argument("--any-model", action="store_true", help="rotation: don't limit to compatible models")
     g.add_argument("--compare-models", action="store_true",
-                   help="render every prompt on EVERY rotation model (same seed) and write compare.html")
+                   help="write ONE prompt and render it -n times, split across the rotation models "
+                        "(same seeds on each); writes compare.html")
     g.add_argument("--model-dirs", help="folders (separated by ;) where model files live, for the check")
     g.add_argument("--comfy-test", action="store_true", help="test the ComfyUI connection and exit")
 

@@ -25,6 +25,7 @@ targets = ["krea2"]
 min_words = 0
 max_words = 0
 filler_check = true
+detail_check = true             # re-ask with a correction when ages, hair, camera, lighting... don't match the scene
 max_filler_hits = 2
 compat_rules = true
 tag_prefix = "masterpiece, best quality, amazing quality"

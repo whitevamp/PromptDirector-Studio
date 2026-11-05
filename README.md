@@ -1,4 +1,4 @@
-# PromptDirector Studio v2.8.2
+# PromptDirector Studio v2.9.1
 
 by **whitevamp**, licensed under CC BY-NC-SA 4.0 (free for non-commercial use; see [License](#license)).
 
@@ -175,13 +175,16 @@ ComfyUI tab > **Model rotation**:
 - **Check models** shows the verdicts and the exact plan before you run. The plan is also written to the log at the start of each run.
 - CLI: `--rotate-random N`, `--rotate-models A B C`, `--any-model`, `--compare-models`, `--model-dirs "/path/one;/path/two"`.
 
-### Compare models (one prompt, many models)
+### Compare models (one prompt, many images)
 
-Turn on **Compare models** to use a prompt as a test bed. Instead of spreading the prompts across the models, every prompt is rendered on *every* model in the rotation (the random N or your list), with the **same seed**, so the model is the only thing that changes.
+Turn on **Compare models** to use one prompt as a test bed. The LLM writes **one** prompt, and the **Prompts** number becomes the number of **images** rendered from it, split evenly across the models in the rotation (the random N or your list).
 
-- Set **Prompts** to 1 for a pure side-by-side. With more prompts, each one goes to each model: 3 prompts x 4 models = 12 images.
-- With send mode `end`, it works model by model, so each model loads only once.
-- Image files are named `pds_<prompt>_<model>_…`, and the run folder gets a **compare.html**: one row per prompt, one column per model, with the seed and the prompt text. Turn on **Download images** to keep copies in the run folder; otherwise the page loads them from ComfyUI.
+- Every model gets the **same set of seeds**, so the model is the only thing that changes between columns.
+- **One model, Prompts = 50:** the same prompt with 50 different seeds, to see how that model handles it.
+- **4 models, Prompts = 8:** 2 seeds on each model. A number that doesn't split evenly is rounded up, so every model still gets the same seeds (10 across 4 models becomes 12).
+- It works model by model, so each model loads only once.
+- Image files are named `pds_001_s03_<model>_…` (prompt 1, seed 3). The run folder gets a **compare.html** with the prompt text at the top. With one model it shows a gallery of the seed variations; with several, a table with one row per seed and one column per model. Turn on **Download images** to keep copies in the run folder; otherwise the page loads the images from ComfyUI.
+- CLI: `--compare-models -n 50`.
 
 ### Image timing
 
@@ -208,6 +211,7 @@ If a model still gives an empty answer with Thinking `off`, the app retries that
 
 - **Length:** replies far outside the word range are re-asked.
 - **Filler check:** prompts that describe mood or meaning ("atmosphere", "poignant", "evoking", ...) instead of visible things are re-asked.
+- **Detail check:** the prompt must actually use the scene details it was given. Every character's **age** is checked strictly: early/mid/late 20s, "in her twenties", "22-year-old" and "aged 25" are all understood, and an age that matches none of the requested ones is flagged. Hair color, hair length, ethnicity, clothing, camera angle, shot, lighting, location and time/weather are checked more loosely, so a reworded detail still passes ("Latina" for Hispanic/Latino, "wide shot" for wide establishing shot); only a missing or replaced detail fails. When a draft gets the details wrong but is otherwise fine, the app shows the model its own draft with a list of what's wrong and asks for a corrected version, which is faster and more reliable than starting over. Turn it off on the Generation tab (`detail_check = false`). Long free-text values and comic mode aren't checked.
 - **Compatibility rules:** random picks never contradict each other or your fixed fields. For example, no studio light outdoors, no close-up of a group, and no moonlight at midday.
 
 ## Content rule

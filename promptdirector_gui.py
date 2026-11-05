@@ -865,8 +865,8 @@ class App(ctk.CTk):
         self.row(f, "Random: number of models", "comfy", "rotation_count", int,
                  hint="must be <= number of prompts (no limit when comparing); consecutive prompts share a model")
         self.row(f, "Compare models (same prompt on each)", "comfy", "compare_models", bool,
-                 hint="ON = every prompt is rendered on EVERY model above, same seed; set Prompts to 1 for a "
-                      "test bed. Makes compare.html in the run folder")
+                 hint="ON = the LLM writes ONE prompt and 'Prompts' becomes the number of IMAGES, split across "
+                      "the models above with the same seeds on each. Makes compare.html in the run folder")
         r = f._row
         ctk.CTkLabel(f, text="List: models in order", anchor="w").grid(row=r, column=0, sticky="nw", **PAD)
         self.rot_text = ctk.CTkTextbox(f, height=90)
@@ -1538,6 +1538,8 @@ class App(ctk.CTk):
         self.row(f, "Filler check", "generation", "filler_check", bool,
                  hint="re-ask when the prompt describes mood/feelings instead of visible things")
         self.row(f, "Max filler phrases", "generation", "max_filler_hits", int)
+        self.row(f, "Detail check", "generation", "detail_check", bool,
+                 hint="re-ask with a correction when the prompt changes ages, hair, clothing, camera, lighting...")
         self.row(f, "Compatibility rules", "generation", "compat_rules", bool,
                  hint="random picks avoid contradictions (studio light outdoors, close-up of a group, ...)")
 
