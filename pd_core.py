@@ -35,7 +35,7 @@ from typing import Any, Callable
 import pd_comfy as comfy
 import pd_llamaserver as lserver
 
-__version__ = "2.9.1"
+__version__ = "2.9.2"
 
 APP_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("promptdirector")

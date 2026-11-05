@@ -1,4 +1,4 @@
-# PromptDirector Studio v2.9.1
+# PromptDirector Studio v2.9.2
 
 by **whitevamp**, licensed under CC BY-NC-SA 4.0 (free for non-commercial use; see [License](#license)).
 
@@ -169,7 +169,8 @@ ComfyUI tab > **Model rotation**:
 | Model search folders | where your model files live (separated by `;`), so they can be checked |
 
 - **Grouping:** consecutive prompts share a model, so each model is loaded only once. 8 prompts with 4 models gives 2 each; 7 prompts with 3 models gives 3, 2, 2. The rotation counts per prompt: with Images per prompt above 1, a prompt's whole batch uses one model.
-- **Compatibility check:** reads each model file's header (the tensor names; no weights are loaded) and compares its layout with the workflow's model. If a file can't be found, the model name is used as a hint (krea2, flux, sdxl/illustrious/pony, ...). Anything else is "unknown".
+- **Compatibility check:** reads each model file's header (tensor names and shapes; no weights are loaded) and compares it with the workflow's model. Two models count as the same architecture when they have the same **width** (e.g. 3840 for Z-Image, 3072 for FLUX) and the same **number of blocks**. Differences in tensor names don't matter, so fine-tunes saved in diffusers format, fp8/scaled versions and all-in-one files (with the text encoder and VAE baked in) are still recognized. If a file can't be found, the model name is used as a hint (krea2, flux, sdxl/illustrious/pony, ...). Anything else is "unknown".
+  - **Check models** lists every model in the same folder as the workflow's model with its verdict and the reason, plus a count of why the others were rejected. The full list goes to the debug log.
   - Random mode only picks compatible models.
   - List mode skips incompatible models with a warning.
 - **Check models** shows the verdicts and the exact plan before you run. The plan is also written to the log at the start of each run.

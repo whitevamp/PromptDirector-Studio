@@ -19,6 +19,7 @@ import os
 import platform
 import queue
 import random
+from collections import Counter
 import shutil
 import subprocess
 import sys
@@ -946,8 +947,19 @@ class App(ctk.CTk):
                      f"{len(ok)} compatible, {len(no)} not compatible, {len(unk)} unknown (of {len(cands)})"]
             if cc.get("rotation") == "list":
                 lines += [f"  {m}: {v[0]} - {v[1]}" for m, v in verdicts.items()]
-            elif no or unk:
-                lines.append("  e.g. not compatible: " + ", ".join(no[:3]) if no else "")
+            else:
+                # the models next to the workflow's model (same top folder) are the interesting ones
+                top = ref.replace("\\", "/").split("/")[0] if "/" in ref.replace("\\", "/") else None
+                near = [m for m in verdicts if top and m.replace("\\", "/").startswith(top + "/") and m != ref]
+                if near:
+                    lines.append(f"In the {top}/ folder:")
+                    lines += [f"  {m.replace(chr(92), '/').split('/')[-1]}: {verdicts[m][0]} - {verdicts[m][1]}"
+                              for m in near[:25]]
+                    if len(near) > 25:
+                        lines.append(f"  ... and {len(near) - 25} more")
+                reasons = Counter(v[1].split(" (")[0] for v in verdicts.values() if v[0] != "ok")
+                if reasons:
+                    lines.append("Other models: " + ", ".join(f"{n} x {r}" for r, n in reasons.most_common(4)))
             n = cfg["generation"]["count"]
             if cc.get("rotation") != "off":
                 try:

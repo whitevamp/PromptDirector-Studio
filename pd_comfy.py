@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections import Counter
 import logging
 import os
 import random
@@ -650,8 +651,42 @@ def find_model_file(name: str, folder_key: str, cc: dict) -> Path | None:
     return Path(found) if found else None
 
 
-def safetensors_signature(path: Path) -> frozenset | None:
-    """Architecture fingerprint from the safetensors header (tensor names, no weights are loaded)."""
+_NON_DIFFUSION = ("first_stage_model.", "cond_stage_model.", "conditioner.", "text_encoders.", "text_encoder.",
+                  "text_model.", "vae.", "clip_l.", "clip_g.", "t5xxl.", "model_ema.", "embedding_manager.")
+
+
+class ModelSignature:
+    """Architecture fingerprint from a safetensors header (tensor names and shapes; no weights are read).
+
+    names:  normalized module paths (block numbers replaced by #), for a rough layout comparison
+    tops:   top-level module names
+    blocks: number of repeated blocks per top-level module (e.g. layers -> 30)
+    dim:    the most common tensor dimension of the repeated blocks (the model width, e.g. 3840)
+    """
+
+    def __init__(self, names: frozenset, tops: frozenset, blocks: dict, dim: int | None, n: int):
+        self.names, self.tops, self.blocks, self.dim, self.n = names, tops, blocks, dim, n
+
+    def compare(self, other: "ModelSignature") -> tuple[bool, str]:
+        jac = len(self.names & other.names) / max(1, len(self.names | other.names))
+        top_jac = len(self.tops & other.tops) / max(1, len(self.tops | other.tops))
+        shared = set(self.blocks) & set(other.blocks)
+        diff_blocks = [f"{k}: {self.blocks[k]} vs {other.blocks[k]}" for k in sorted(shared)
+                       if self.blocks[k] != other.blocks[k]]
+        if self.dim and other.dim:
+            if self.dim != other.dim:
+                return False, f"different model width ({other.dim}; the workflow's model is {self.dim})"
+            if diff_blocks:
+                return False, "different number of blocks (workflow vs this: " + "; ".join(diff_blocks[:2]) + ")"
+            if shared or top_jac >= 0.5:
+                # same width and same block counts: same architecture, even if some tensors are named
+                # differently (diffusers vs original format, extra scale tensors, merged LoRA leftovers)
+                return True, f"same layout (width {self.dim}, {jac:.0%} name match)"
+            return False, f"different structure ({jac:.0%} name match)"
+        return (jac >= 0.75), f"{'same' if jac >= 0.75 else 'different'} layout ({jac:.0%} name match)"
+
+
+def safetensors_signature(path: Path) -> ModelSignature | None:
     if path.suffix.lower() not in (".safetensors", ".sft"):
         return None
     try:
@@ -662,15 +697,31 @@ def safetensors_signature(path: Path) -> frozenset | None:
             header = json.loads(f.read(n))
     except (OSError, ValueError, _struct.error):
         return None
-    sig = set()
-    for k in header:
-        if k == "__metadata__":
-            continue
-        k = _re.sub(r"^(model\.diffusion_model\.|diffusion_model\.|model\.|unet\.)", "", k)
-        parts = _re.sub(r"\d+", "#", k).split(".")
-        if len(parts) > 1:
-            sig.add(".".join(parts[:min(3, len(parts) - 1)]))
-    return frozenset(sig) if sig else None
+    keys = [k for k in header if k != "__metadata__"]
+    # all-in-one checkpoints: keep only the diffusion model's tensors
+    if any(k.startswith("model.diffusion_model.") for k in keys):
+        keys = [k for k in keys if k.startswith("model.diffusion_model.")]
+    else:
+        keys = [k for k in keys if not k.startswith(_NON_DIFFUSION)]
+    names, tops, idx = set(), set(), {}
+    dims = Counter()
+    for k in keys:
+        k2 = _re.sub(r"^(model\.diffusion_model\.|diffusion_model\.|model\.|unet\.|transformer\.)", "", k)
+        parts = k2.split(".")
+        tops.add(parts[0])
+        if len(parts) > 1 and parts[1].isdigit():
+            idx.setdefault(parts[0], set()).add(parts[1])
+        norm = _re.sub(r"\d+", "#", k2).split(".")
+        if len(norm) > 1:
+            names.add(".".join(norm[:min(3, len(norm) - 1)]))
+        shape = (header.get(k) or {}).get("shape") or []
+        if len(shape) == 2 and len(parts) > 1 and parts[1].isdigit():
+            dims.update(d for d in shape if d >= 64)
+    if not names:
+        return None
+    blocks = {t: len(v) for t, v in idx.items() if len(v) > 1}
+    return ModelSignature(frozenset(names), frozenset(tops), blocks,
+                          dims.most_common(1)[0][0] if dims else None, len(keys))
 
 
 def check_compat(cc: dict, reference: str, candidates: list[str], folder_key: str) -> dict[str, tuple[str, str]]:
@@ -683,21 +734,26 @@ def check_compat(cc: dict, reference: str, candidates: list[str], folder_key: st
         if c == reference:
             out[c] = ("ok", "the workflow's own model")
             continue
-        sig = None
+        sig, f = None, None
         if ref_sig:
             f = find_model_file(c, folder_key, cc)
             sig = safetensors_signature(f) if f else None
         if ref_sig and sig:
-            sim = len(ref_sig & sig) / max(1, len(ref_sig | sig))
-            out[c] = ("ok", f"same layout ({sim:.0%} match)") if sim >= 0.75 else \
-                     ("no", f"different architecture ({sim:.0%} match)")
+            ok, why = ref_sig.compare(sig)
+            out[c] = ("ok" if ok else "no", why)
             continue
         fam = name_family(c)
         if ref_fam and fam:
             out[c] = ("ok", f"name looks like {fam}") if fam == ref_fam else \
                      ("no", f"name looks like {fam}, workflow uses {ref_fam}")
+        elif f is not None:
+            out[c] = ("unknown", f"can't read the file's layout ({f.suffix or 'no extension'})")
+        elif not ref_sig:
+            out[c] = ("unknown", "the workflow's model file wasn't found in the search folders")
         else:
             out[c] = ("unknown", "file not found in the search folders and the name gives no hint")
+    for c, (v, why) in out.items():
+        log.debug("compat %s: %s - %s", c, v, why)
     return out
 
 
