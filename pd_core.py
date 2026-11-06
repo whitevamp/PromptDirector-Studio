@@ -35,7 +35,7 @@ from typing import Any, Callable
 import pd_comfy as comfy
 import pd_llamaserver as lserver
 
-__version__ = "2.9.2"
+__version__ = "3.0.1"
 
 APP_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("promptdirector")
@@ -165,6 +165,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Per-column random switch for empty per-character boxes (needs random_enabled).
         "random_people": {"role": True, "age": True, "ethnicity": False, "hair_color": True,
                           "hair_length": True, "clothing": False},
+        # A field (or a character's cell) may hold a LIST of options: one is used per prompt.
+        # spread = go through the list evenly (shuffled rounds) instead of a pure random pick.
+        "spread": {},                     # scene field key -> bool
+        "spread_people": {},              # character column key -> bool
     },
     "output": {
         "directory": "",                  # empty = current working directory
@@ -430,6 +434,93 @@ def save_config(cfg: dict, path: Path) -> None:
         path.write_text(header + dump_toml(cfg).lstrip("\n"), encoding="utf-8")
 
 
+def norm_value(v) -> "str | list[str]":
+    """A field value: one string, or a list of 2+ options (one is used per prompt)."""
+    if isinstance(v, (list, tuple)):
+        vals = [str(x).strip() for x in v if str(x or "").strip()]
+        vals = list(dict.fromkeys(vals))
+        return vals if len(vals) > 1 else (vals[0] if vals else "")
+    return str(v or "").strip()
+
+
+def field_values(v) -> list[str]:
+    """All options of a field value (string or list) as a list; empty -> []."""
+    if isinstance(v, (list, tuple)):
+        return [str(x) for x in v if str(x).strip()]
+    return [v] if v else []
+
+
+def show_value(v) -> str:
+    vals = field_values(v)
+    return vals[0] if len(vals) == 1 else ("one of: " + " | ".join(vals) if vals else "")
+
+
+def _migrate_subject(s: dict) -> None:
+    """The Subject field was removed (v3.0): its text becomes the characters' roles."""
+    subj = s["fields"].get("subject")
+    if not subj:
+        s["random"]["subject"] = False
+        return
+    text = field_values(subj)[0]
+    if not any(p.get("role") for p in s["people"]):
+        roles = [r.strip() for r in re.split(r",\s*|\s+and\s+", text) if r.strip()][:MAX_CHARACTERS]
+        for p, r in zip(s["people"], roles):
+            p["role"] = r
+        if roles:
+            s["random_people"]["role"] = False          # typed roles are meant to be used
+        if roles and not s["fields"].get("characters"):
+            s["fields"]["characters"] = str(len(roles))
+            s["random"]["characters"] = False
+        log.info("Scene: the Subject field is now the Role column; moved '%s' into the characters' roles", text)
+    s["fields"]["subject"] = ""
+    s["random"]["subject"] = False
+
+
+class ChoicePicker:
+    """Picks one option from a field's list per prompt: random, or 'spread evenly' (shuffled rounds)."""
+
+    def __init__(self, rng: random.Random):
+        self.rng = rng
+        self.decks: dict[str, list[str]] = {}
+
+    def pick(self, key: str, values: list[str], spread: bool) -> str:
+        if not values:
+            return ""
+        if len(values) == 1:
+            return values[0]
+        if not spread:
+            return self.rng.choice(values)
+        deck = self.decks.get(key)
+        if not deck or set(deck) - set(values):
+            deck = []
+        if not deck:
+            deck = list(values)
+            self.rng.shuffle(deck)
+        val = deck.pop()
+        self.decks[key] = deck
+        return val
+
+
+def resolve_lists(cfg: dict, picker: ChoicePicker) -> dict:
+    """A copy of cfg with every option list collapsed to the option used for this prompt.
+    The lists themselves stay available in scene['_lists'] (comic panels pick their own)."""
+    sc = cfg["scene"]
+    has = any(isinstance(v, list) for v in sc["fields"].values()) or \
+        any(isinstance(v, list) for p in sc.get("people", []) for v in p.values())
+    if not has:
+        return cfg
+    out = dict(cfg)
+    s2 = dict(sc)
+    s2["_lists"] = {k: v for k, v in sc["fields"].items() if isinstance(v, list)}
+    s2["fields"] = {k: picker.pick(k, v, sc.get("spread", {}).get(k, False)) if isinstance(v, list) else v
+                    for k, v in sc["fields"].items()}
+    s2["people"] = [{k: picker.pick(f"p{i}.{k}", v, sc.get("spread_people", {}).get(k, False))
+                     if isinstance(v, list) else v for k, v in p.items()}
+                    for i, p in enumerate(sc.get("people", []))]
+    out["scene"] = s2
+    return out
+
+
 def validate_config(cfg: dict) -> dict:
     """Validates and normalizes in place; returns cfg. Raises ConfigError."""
     b, m, g, o, s = (cfg[k] for k in ("backend", "model", "generation", "output", "scene"))
@@ -516,6 +607,8 @@ def validate_config(cfg: dict) -> dict:
         cc["vram_wait"] = max(0.0, float(cc.get("vram_wait", 30) or 0))
     except (TypeError, ValueError):
         errs.append("comfy.vram_wait must be a number")
+    if cc.get("missing_loras", "skip") not in ("skip", "stop"):
+        errs.append("comfy.missing_loras must be skip or stop")
     if cc["enabled"] and cc["compare_models"] and cc.get("rotation", "off") == "off":
         errs.append("ComfyUI: 'Compare models' needs 'Rotate models' set to random or list "
                     "(those are the models every prompt is rendered on)")
@@ -545,7 +638,9 @@ def validate_config(cfg: dict) -> dict:
     # scene
     for k in FIELD_KEYS:
         s["fields"].setdefault(k, "")
-        s["fields"][k] = str(s["fields"][k] or "").strip()
+        s["fields"][k] = norm_value(s["fields"][k])
+    s["spread"] = {k: bool(v) for k, v in (s.get("spread") or {}).items()}
+    s["spread_people"] = {k: bool(v) for k, v in (s.get("spread_people") or {}).items()}
     for k in FIELD_KEYS:
         if k != "extra":
             s["random"].setdefault(k, False)
@@ -555,15 +650,16 @@ def validate_config(cfg: dict) -> dict:
     people = list(s.get("people") or [])
     people = [p if isinstance(p, dict) else {} for p in people][:MAX_CHARACTERS]
     people += [{} for _ in range(MAX_CHARACTERS - len(people))]
-    s["people"] = [{k: str(p.get(k, "") or "").strip() for k in PERSON_KEYS} for p in people]
+    s["people"] = [{k: norm_value(p.get(k, "")) for k in PERSON_KEYS} for p in people]
+    _migrate_subject(s)
     for i, p in enumerate(s["people"], 1):
-        age = p["age"]
-        nums = [int(x) for x in re.findall(r"\d+", age)]
-        if nums and min(nums) < 18:
-            errs.append(f"Character {i}: age must be 18 or older (got '{age}')")
-    nc = s["fields"]["characters"]
-    if nc and (not nc.isdigit() or not 1 <= int(nc) <= MAX_CHARACTERS):
-        errs.append(f"Number of characters must be 1-{MAX_CHARACTERS} (or empty), got '{nc}'")
+        for age in field_values(p["age"]):
+            nums = [int(x) for x in re.findall(r"\d+", age)]
+            if nums and min(nums) < 18:
+                errs.append(f"Character {i}: age must be 18 or older (got '{age}')")
+    for nc in field_values(s["fields"]["characters"]):
+        if not nc.isdigit() or not 1 <= int(nc) <= MAX_CHARACTERS:
+            errs.append(f"Number of characters must be 1-{MAX_CHARACTERS} (or empty), got '{nc}'")
     if errs:
         raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(errs))
     if not b["host"]:
@@ -1042,6 +1138,7 @@ def build_comic_seed(cfg: dict, presets: dict, rng: random.Random, base: str | N
                      allow_random: bool = True) -> "SceneSeed":
     cm, sc = cfg["comic"], cfg["scene"]
     f, rnd = sc["fields"], sc["random"]
+    lists = sc.get("_lists") or {}
     use_random = allow_random and sc["random_enabled"]
     compat = cfg["generation"].get("compat_rules", True)
     panels = comic_grid(cm["layout"])
@@ -1057,7 +1154,7 @@ def build_comic_seed(cfg: dict, presets: dict, rng: random.Random, base: str | N
     if cm["mode"] == "vignettes":
         per_keys.append("action")
     for k in per_keys:                 # these are rolled per panel instead
-        if origin.get(k) == "random":
+        if origin.get(k) == "random" or (k in lists and origin.get(k) == "user"):
             shared.pop(k, None)
             origin.pop(k, None)
 
@@ -1065,6 +1162,11 @@ def build_comic_seed(cfg: dict, presets: dict, rng: random.Random, base: str | N
     for p in panels:
         pd = {}
         for k in per_keys:
+            opts = lists.get(k)
+            if opts and not (use_random and rnd.get(k, False)):
+                fresh = [o for o in opts if o not in used_locs] if k == "location" else opts
+                pd[k] = rng.choice(fresh or opts)          # each panel picks its own option
+                continue
             if f.get(k) and not (use_random and rnd.get(k, False)):
                 pd[k] = f[k]
                 continue
@@ -1318,8 +1420,8 @@ def content_problem(text: str, cfg: dict) -> str | None:
 
 def check_scene_inputs(cfg: dict, fixed_scenes: list[str] | None, presets: dict | None) -> None:
     """Refuse to start when user-entered scene details break the content rule; drop bad preset entries."""
-    texts = [v for v in cfg["scene"]["fields"].values() if v] + list(fixed_scenes or [])
-    texts += [v for p in cfg["scene"].get("people", []) for v in p.values() if v]
+    texts = [x for v in cfg["scene"]["fields"].values() for x in field_values(v)] + list(fixed_scenes or [])
+    texts += [x for p in cfg["scene"].get("people", []) for v in p.values() for x in field_values(v)]
     for t in texts:
         if content_problem(t, cfg) or (cfg["generation"]["content_rating"] != "sfw" and _MINOR_RE.search(t)):
             raise ConfigError("A scene field or scene idea describes a minor or other content this tool won't "
@@ -1537,7 +1639,7 @@ def build_people(cfg: dict, presets: dict, rng: random.Random, n: int | None, us
         people.append(p)
     # roles: per-person roles build the subject when the subject field is empty
     user_roles = [p.get("role") for p in people]
-    if any(user_roles) and origin.get("subject") != "user":
+    if (any(user_roles) or (use_random and rnd.get("role"))) and origin.get("subject") != "user":
         pool = presets.get("role") or presets.get("subject") or ["a person"]
         roles = [r or (rng.choice(pool) if use_random and rnd.get("role") else "") for r in user_roles]
         if all(roles):
@@ -1596,6 +1698,7 @@ class SceneGenerator:
         self.backend = backend
         self.fixed = [s for s in (fixed_scenes or []) if s.strip()]
         self.presets = presets or load_presets(cfg)
+        self.picker = ChoicePicker(rng)
         self.file_scenes: list[str] = []
         if self.g["seed_mode"] == "file" and not self.fixed:
             p = resolve_path(self.g["scenes_file"])
@@ -1620,6 +1723,14 @@ class SceneGenerator:
         return SceneSeed(text, source, details, origin)
 
     def next(self, index: int, dry_run: bool = False) -> SceneSeed:
+        base_cfg = self.cfg
+        self.cfg = resolve_lists(base_cfg, self.picker)     # option lists -> this prompt's pick
+        try:
+            return self._next(index, dry_run)
+        finally:
+            self.cfg = base_cfg
+
+    def _next(self, index: int, dry_run: bool = False) -> SceneSeed:
         if comic_on(self.cfg):
             if self.fixed:
                 return build_comic_seed(self.cfg, self.presets, self.rng, self.fixed[index % len(self.fixed)], False)
@@ -2046,7 +2157,15 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
     log.info("Targets: %s | length %d-%d words | filler check: %s | detail check: %s | compat rules: %s",
              ", ".join(g["targets"]), *word_range(cfg), "on" if g["filler_check"] else "off",
              "on" if g.get("detail_check", True) else "off", "on" if g["compat_rules"] else "off")
-    log.info("Fixed fields: %s", ", ".join(f"{FIELD_LABELS[k]}={v!r}" for k, v in filled.items()) or "(none)")
+    log.info("Fixed fields: %s", ", ".join(
+        f"{FIELD_LABELS[k]}=" + (repr(v) if isinstance(v, str) else "[" + " | ".join(v) + "]"
+                                 + (" spread evenly" if cfg["scene"]["spread"].get(k) else ""))
+        for k, v in filled.items()) or "(none)")
+    people_set = [(i, {k: v for k, v in p.items() if v})
+                  for i, p in enumerate(cfg["scene"]["people"], 1) if any(p.values())]
+    for i, p in people_set:
+        log.info("Character %d: %s", i, "; ".join(
+            f"{k}={v!r}" if isinstance(v, str) else f"{k}=[{' | '.join(v)}]" for k, v in p.items()))
     log.info("Log: %s%s", res.main_log, f" | debug log: {res.debug_log}" if res.debug_log else "")
     log.debug("Effective config: %s", json.dumps(redacted(cfg), indent=2))
 
@@ -2085,6 +2204,7 @@ def run_job(cfg: dict, *, fixed_scenes: list[str] | None = None, system_prompt_t
                          "after all prompts" if cc["send_mode"] == "end" else "after each prompt",
                          "prompt files saved too" if cc["save_prompts"] else "prompt files NOT saved (ComfyUI only)")
                 log.info(comfy.test_connection(cc))
+                sender.preflight()           # models / LoRAs the workflow needs, before any LLM time is spent
             except comfy.ComfyError as e:
                 raise ConfigError(f"ComfyUI: {e}") from e
             if cc["workflow"] == "builtin_sdxl" and "illustrious" not in g["targets"] and cc["prompt_source"] != "prose":

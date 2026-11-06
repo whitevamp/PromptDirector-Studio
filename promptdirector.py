@@ -56,9 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("-t", "--temperature", type=float)
     g.add_argument("--max-tokens", type=int)
 
-    g = p.add_argument_group("scene fields (empty = random / LLM's choice)")
+    g = p.add_argument_group("scene fields (empty = random / LLM's choice; 'a|b|c' = one of these per prompt)")
     for key, label, hint, _ in core.SCENE_FIELDS:
+        if key == "subject":
+            hint = "old option: becomes the characters' roles (use --person role=...)"
         g.add_argument(f"--{key.replace('_', '-')}", dest=f"field_{key}", metavar="TEXT", help=f"{label}: {hint}")
+    g.add_argument("--spread", nargs="+", metavar="FIELD",
+                   help="go through these fields' a|b|c options evenly (e.g. --spread location lighting)")
     r = g.add_mutually_exclusive_group()
     r.add_argument("--random", dest="random", action="store_true", default=None, help="random on (master switch)")
     r.add_argument("--no-random", dest="random", action="store_false",
@@ -214,7 +218,18 @@ def apply_cli(cfg: dict, a: argparse.Namespace) -> dict:
     for key in core.FIELD_KEYS:
         v = getattr(a, f"field_{key}")
         if v is not None:
-            sc["fields"][key] = v
+            sc["fields"][key] = [x.strip() for x in v.split("|")] if "|" in v else v   # a|b|c = options
+            if v.strip() and key in sc["random"]:
+                sc["random"][key] = False          # typed on the command line = use it
+    if a.spread:
+        for k in a.spread:
+            k = k.replace("-", "_")
+            if k in core.FIELD_KEYS:
+                sc.setdefault("spread", {})[k] = True
+            elif k in core.PERSON_KEYS:
+                sc.setdefault("spread_people", {})[k] = True
+            else:
+                raise core.ConfigError(f"--spread: unknown field '{k}'")
     if a.person:
         people = []
         for spec in a.person[:core.MAX_CHARACTERS]:
@@ -225,7 +240,8 @@ def apply_cli(cfg: dict, a: argparse.Namespace) -> dict:
                     k = k.strip().lower().replace(" ", "_")
                     if k not in p:
                         raise core.ConfigError(f"--person: unknown key '{k}' (use {', '.join(core.PERSON_KEYS)})")
-                    p[k] = v.strip()
+                    p[k] = [x.strip() for x in v.split("|")] if "|" in v else v.strip()
+                    sc.setdefault("random_people", {})[k] = False   # typed = use it
             people.append(p)
         sc["people"] = people + [{k: "" for k in core.PERSON_KEYS}] * (core.MAX_CHARACTERS - len(people))
         if not sc["fields"].get("characters"):

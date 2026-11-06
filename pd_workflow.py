@@ -4,7 +4,9 @@
 pd_workflow.py — inspect and edit a ComfyUI API-format workflow (the file from Workflow > Export (API)).
 
 Supports:
-* LoRAs: rgthree "Power Lora Loader" entries (lora_1, lora_2, ...), LoraLoader and LoraLoaderModelOnly nodes.
+* LoRAs: rgthree "Power Lora Loader" entries (lora_1, lora_2, ...), LoraLoader and LoraLoaderModelOnly nodes,
+  plus other LoRA nodes found by their inputs: single loaders (LoraLoader|pysssss, Nunchaku, ...) and
+  stacks with numbered slots (CR LoRA Stack, LoRA Stacker, Lora Loader Stack (rgthree), ...).
   Edit name / strength / on-off, remove (Power entries are deleted; loader nodes are unwired and removed),
   add (a Power entry if the workflow has a Power Lora Loader, otherwise a new LoraLoaderModelOnly node
   wired in after the model source).
@@ -28,6 +30,41 @@ UPSCALE_SCALE_KEYS = ("scale_by", "upscale_by", "scale", "upscale_factor")
 
 def _is_ref(v) -> bool:
     return isinstance(v, list) and len(v) == 2 and isinstance(v[0], str)
+
+
+LORA_EXTS = (".safetensors", ".pt", ".ckpt", ".bin", ".pth", ".sft", ".gguf")
+_SINGLE_STRENGTH = ("strength_model", "lora_strength", "strength", "model_strength", "model_weight", "weight")
+_SINGLE_CLIP = ("strength_clip", "clip_strength", "clip_weight")
+
+
+def _is_lora_file(v) -> bool:
+    return isinstance(v, str) and v.lower().endswith(LORA_EXTS)
+
+
+def norm_name(name: str) -> str:
+    """Model names compare equal whatever the path separator."""
+    return str(name).replace("\\", "/").strip()
+
+
+def _slot_keys(inp: dict, key: str) -> tuple[str | None, list[str], str | None]:
+    """For a numbered stack slot like lora_name_3 / lora_03: (strength key, clip keys, on/off switch key)."""
+    m = re.search(r"(\d+)$", key)
+    if not m:
+        return None, [], None
+    num = m.group(1)
+    nums = {num, str(int(num)), f"{int(num):02d}"}
+    def first(patterns):
+        for pat in patterns:
+            for n in nums:
+                k = pat.format(n)
+                if k in inp and not _is_ref(inp[k]):
+                    return k
+        return None
+    strength = first(("lora_wt_{}", "model_weight_{}", "model_str_{}", "strength_{}", "lora_strength_{}",
+                      "strength_model_{}", "weight_{}"))
+    clip = [k for k in (first(("clip_weight_{}", "clip_str_{}", "strength_clip_{}", "clip_strength_{}")),) if k]
+    switch = first(("switch_{}", "enabled_{}", "on_{}", "lora_{}_on"))
+    return strength, clip, switch
 
 
 class WorkflowDoc:
@@ -97,10 +134,67 @@ class WorkflowDoc:
                             "strength": inp.get("strength_model", 1.0),
                             "on": float(inp.get("strength_model", 1.0) or 0) != 0.0 or
                                   float(inp.get("strength_clip", 0) or 0) != 0.0})
+            else:
+                out += self._generic_loras(nid, cls, inp)
         return out
+
+    def _generic_loras(self, nid: str, cls: str, inp: dict) -> list[dict]:
+        """LoRA files in any other node: an input whose name mentions 'lora' (or a 'lora' node) holding a file."""
+        found = []
+        lora_node = "lora" in cls.lower()
+        keys = [k for k, v in inp.items() if (_is_lora_file(v) or (v == "None" and "lora" in k.lower()))
+                and ("lora" in k.lower() or (lora_node and k.lower().endswith("name")))]
+        numbered = [k for k in keys if re.search(r"\d+$", k)]
+        for k in keys:
+            v = inp[k]
+            if k in numbered:
+                strength, clip, switch = _slot_keys(inp, k)
+                if v == "None":
+                    continue
+                on = True
+                if switch is not None:
+                    on = str(inp[switch]).lower() in ("on", "true", "1", "yes")
+                elif strength is not None:
+                    try:
+                        on = float(inp[strength] or 0) != 0.0
+                    except (TypeError, ValueError):
+                        pass
+                found.append({"node": nid, "kind": "stack", "key": k, "name": v,
+                              "strength": inp.get(strength, 1.0) if strength else 1.0, "on": on,
+                              "strength_key": strength, "clip_keys": clip, "switch_key": switch})
+            elif _is_lora_file(v):
+                strength = next((x for x in _SINGLE_STRENGTH if x in inp and not _is_ref(inp[x])), None)
+                clip = [x for x in _SINGLE_CLIP if x in inp and not _is_ref(inp[x])]
+                on = True
+                if strength is not None:
+                    try:
+                        on = float(inp[strength] or 0) != 0.0
+                    except (TypeError, ValueError):
+                        pass
+                found.append({"node": nid, "kind": "loader", "key": k, "name": v,
+                              "strength": inp.get(strength, 1.0) if strength else 1.0, "on": on,
+                              "strength_key": strength, "clip_keys": clip, "switch_key": None})
+        return found
 
     def set_lora(self, entry: dict, name: str | None = None, strength: float | None = None, on: bool | None = None):
         n = self.nodes[entry["node"]]["inputs"]
+        if entry["kind"] in ("stack", "loader"):
+            if name is not None:
+                n[entry["key"]] = name
+            sk, sw = entry.get("strength_key"), entry.get("switch_key")
+            if strength is not None and sk:
+                n[sk] = float(strength)
+                for ck in entry.get("clip_keys", []):
+                    n[ck] = float(strength)
+            if on is not None:
+                if sw:
+                    n[sw] = "On" if on else "Off"
+                elif on is False and sk:
+                    n[sk] = 0.0
+                    for ck in entry.get("clip_keys", []):
+                        n[ck] = 0.0
+            self.dirty = True
+            return
         if entry["kind"] == "power":
             e = n[entry["key"]]
             if name is not None:
@@ -124,6 +218,13 @@ class WorkflowDoc:
 
     def remove_lora(self, entry: dict):
         nid = entry["node"]
+        if entry["kind"] == "stack":                      # empty the slot
+            inp = self.nodes[nid]["inputs"]
+            inp[entry["key"]] = "None"
+            if entry.get("switch_key"):
+                inp[entry["switch_key"]] = "Off"
+            self.dirty = True
+            return
         if entry["kind"] == "power":
             del self.nodes[nid]["inputs"][entry["key"]]
         else:
@@ -134,6 +235,25 @@ class WorkflowDoc:
                 self._redirect([nid, 1], inp["clip"], skip=nid)
             del self.nodes[nid]
         self.dirty = True
+
+    def missing_loras(self, available) -> list[dict]:
+        """LoRAs whose file ComfyUI doesn't have (switched-off ones too: ComfyUI validates every loader)."""
+        have = {norm_name(x) for x in available}
+        return [e for e in self.loras() if e["name"] and norm_name(e["name"]) not in have]
+
+    def missing_models(self, lists: dict, skip_fields=()) -> list[tuple[str, str, str]]:
+        """(node title, field, name) for loader fields whose file ComfyUI doesn't list."""
+        kind = {"ckpt_name": "checkpoints", "unet_name": "diffusion_models", "vae_name": "vae"}
+        out = []
+        for nid, field, val in self.loaders():
+            if field in skip_fields or not isinstance(val, str) or not val:
+                continue
+            lst = lists.get(kind.get(field, "text_encoders"))
+            if lst is None:
+                continue
+            if norm_name(val) not in {norm_name(x) for x in lst}:
+                out.append((self.title(nid), field, val))
+        return out
 
     def _model_source(self) -> list | None:
         """The [node, slot] feeding the samplers' model input, followed up through LoRA-like nodes."""

@@ -88,6 +88,7 @@ wait_for_images = true
 download_images = false
 unload_llm = true
 free_vram_after = true
+missing_loras = "skip"          # LoRA file not in ComfyUI: skip = leave it out (warned), stop = stop the run
 vram_wait = 30                  # after unloading the LLM, wait (s) until its VRAM is really free; 0 = off
 timeout = 900
 rotation = "off"
@@ -113,12 +114,11 @@ people = [{"role" = "", "age" = "", "ethnicity" = "", "hair_color" = "", "hair_l
 [scene.fields]
 style = ""
 characters = ""
-subject = ""
 action = ""
 camera_angle = ""
 shot = ""
 lighting = ""
-location = ""
+location = ""                   # several options: location = ["foggy pier", "rooftop garden, Tokyo"]
 time_weather = ""
 composition = ""
 extra = ""
@@ -126,7 +126,6 @@ extra = ""
 [scene.random]
 style = true
 characters = true
-subject = true
 action = true
 camera_angle = true
 shot = true
@@ -142,6 +141,13 @@ ethnicity = false
 hair_color = true
 hair_length = true
 clothing = false
+
+# Fields with several options: go through them evenly instead of picking at random.
+[scene.spread]
+location = false
+
+[scene.spread_people]
+hair_color = false
 
 [output]
 directory = ""

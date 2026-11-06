@@ -101,6 +101,7 @@ DEFAULT_COMFY = {
     "rotation_compatible_only": True, # only use models with the same architecture as the workflow's model
     "compare_models": False,          # ON = every prompt is rendered on EVERY rotation model (same seed), to compare
     "vram_wait": 30,                  # seconds to wait for the LLM's VRAM to be released before images (0 = off)
+    "missing_loras": "skip",          # LoRA file not in ComfyUI: skip = leave it out of the job (warned); stop = stop
     "model_search_dirs": "",          # extra folders (separated by ;) where model files live, for the check
 }
 
@@ -839,6 +840,48 @@ class ComfySender:
         self._prompt_seeds: dict = {}
         self.per_model = 1                         # compare mode: images per model (seed variations)
         self.compare_rows: list[dict] = []         # for compare.html
+
+    def preflight(self) -> list[str]:
+        """Before any prompt is written: check that ComfyUI has every model and LoRA the workflow uses.
+        Missing LoRAs are left out of the jobs (or stop the run); a missing model always stops it.
+        Returns the warnings that were logged."""
+        if self.template is None:
+            return []
+        try:
+            lists = _list_via_api(self.cc)
+        except ComfyError as e:
+            log.warning("ComfyUI: couldn't read its model lists, so the workflow's models and LoRAs weren't "
+                        "checked (%s)", e)
+            return []
+        from pd_workflow import WorkflowDoc
+        doc = WorkflowDoc(self.template)
+        warnings = []
+        skip = {"ckpt_name"} if self.target == "checkpoint" else {"unet_name"}
+        if self.cc.get("rotation", "off") == "off":
+            skip = set()
+        missing = doc.missing_models(lists, skip_fields=skip)
+        if missing:
+            raise ComfyError("the workflow uses model file(s) that ComfyUI doesn't have: "
+                             + "; ".join(f"{t} {f} = {v}" for t, f, v in missing)
+                             + ". Pick the right file on the Workflow tab (Choose...) and save the workflow.")
+        if "loras" in lists:
+            gone = doc.missing_loras(lists["loras"])
+            if gone:
+                names = ", ".join(dict.fromkeys(e["name"] for e in gone))
+                if self.cc.get("missing_loras", "skip") == "stop":
+                    raise ComfyError(f"the workflow uses LoRA file(s) that ComfyUI doesn't have: {names}. "
+                                     "Fix or remove them on the Workflow tab, or set 'Missing LoRAs' to skip.")
+                for e in gone:
+                    try:
+                        doc.remove_lora(e)
+                    except (KeyError, ValueError):
+                        pass
+                self.template = doc.nodes
+                msg = (f"ComfyUI doesn't have these LoRA file(s), so they are left out of every image: {names}. "
+                       "Fix or remove them on the Workflow tab.")
+                log.warning("ComfyUI: %s", msg)
+                warnings.append(msg)
+        return warnings
 
     def set_plan(self, n_jobs: int, lists: dict) -> str:
         plan, report = plan_rotation(self.cc, n_jobs, lists, self.template, self.rng)

@@ -206,6 +206,10 @@ def open_path(path: Path) -> None:
         messagebox.showerror(APP_TITLE, f"Could not open {path}:\n{e}")
 
 
+MAX_OPTIONS = 6                    # option boxes per field / character cell
+HIDDEN_FIELDS = {"subject"}        # replaced by the Role column (v3.0)
+
+
 class App(ctk.CTk):
     def __init__(self, config_path: str | None = None):
         super().__init__()
@@ -393,6 +397,16 @@ class App(ctk.CTk):
         walk("", core.DEFAULT_CONFIG)
         self.format_vars = {f: tk.BooleanVar(self) for f in core.VALID_FORMATS}
         self.people_vars = [{k: tk.StringVar(self) for k in core.PERSON_KEYS} for _ in range(core.MAX_CHARACTERS)]
+        # option lists: box 1 is the normal field variable, boxes 2..MAX_OPTIONS are extra
+        self.field_count = {k: tk.StringVar(self, "1") for k in core.FIELD_KEYS}
+        self.field_extra = {k: [tk.StringVar(self) for _ in range(MAX_OPTIONS - 1)] for k in core.FIELD_KEYS}
+        self.people_count = {k: tk.StringVar(self, "1") for k in core.PERSON_KEYS}
+        self.people_extra = [{k: [tk.StringVar(self) for _ in range(MAX_OPTIONS - 1)] for k in core.PERSON_KEYS}
+                             for _ in range(core.MAX_CHARACTERS)]
+        for k in core.FIELD_KEYS:
+            self.bind_var("scene.spread", k, bool)
+        for k in core.PERSON_KEYS:
+            self.bind_var("scene.spread_people", k, bool)
         self.rot_models_var = tk.StringVar(self)          # rotation model list, one per line
         self.target_vars = {t: tk.BooleanVar(self) for t in core.VALID_TARGETS}
 
@@ -588,35 +602,64 @@ class App(ctk.CTk):
 
         f = ctk.CTkScrollableFrame(tab)
         f.pack(fill="both", expand=True, pady=4)
-        f.grid_columnconfigure(1, weight=1)
-        for c, h in enumerate(("Field", "Value (empty = random / LLM decides)", "Random", "", "")):
-            ctk.CTkLabel(f, text=h, text_color=MUTED, font=self.font_small).grid(row=0, column=c, sticky="w", padx=8)
-        self.field_widgets: dict = {}
-        for r, (key, label, hint, can_random) in enumerate(core.SCENE_FIELDS, start=1):
+        f.grid_columnconfigure(3, weight=1)
+        for c, h in enumerate(("Field", "Random", "Options", "Value (empty = random / LLM decides; "
+                                                           "2+ options = one of them per prompt)", "", "")):
+            ctk.CTkLabel(f, text=h, text_color=MUTED, font=self.font_small).grid(row=0, column=c, sticky="w", padx=6)
+        self.field_widgets: dict = {}          # key -> list of value boxes (box 1 first)
+        self.field_spread_w: dict = {}
+        r = 0
+        for key, label, hint, can_random in core.SCENE_FIELDS:
+            if key in HIDDEN_FIELDS:
+                continue
+            r += 1
             ctk.CTkLabel(f, text=f"{label}\n{hint}", anchor="w", justify="left"
-                         ).grid(row=r, column=0, sticky="w", padx=8, pady=3)
+                         ).grid(row=r, column=0, sticky="nw", padx=6, pady=3)
             var = self.bind_var("scene.fields", key, str)
-            if key == "characters":
-                cb = ctk.CTkComboBox(f, values=[""] + [str(i) for i in range(1, core.MAX_CHARACTERS + 1)],
-                                     variable=var)
-            elif key == "extra":
-                cb = ctk.CTkEntry(f, textvariable=var)
-            else:
-                cb = self._picker_entry(f, var, label, lambda k=key: self._field_choices(k))
-            cb.grid(row=r, column=1, sticky="ew", padx=8, pady=3)
-            self.field_widgets[key] = cb
             if can_random:
                 rv = self.bind_var("scene.random", key, bool)
                 ctk.CTkCheckBox(f, text="", variable=rv, onvalue=True, offvalue=False, width=30
-                                ).grid(row=r, column=2, padx=8)
+                                ).grid(row=r, column=1, sticky="n", padx=6, pady=6)
+            cell = ctk.CTkFrame(f, fg_color="transparent")
+            cell.grid(row=r, column=3, sticky="ew", padx=6, pady=3)
+            cell.grid_columnconfigure(0, weight=1)
+            if key == "characters":
+                box = ctk.CTkComboBox(cell, values=[""] + [str(i) for i in range(1, core.MAX_CHARACTERS + 1)],
+                                      variable=var)
+                box.grid(row=0, column=0, sticky="ew")
+                self.field_widgets[key] = [box]
+            else:
+                ctk.CTkOptionMenu(f, values=[str(i) for i in range(1, MAX_OPTIONS + 1)], width=60,
+                                  variable=self.field_count[key],
+                                  command=lambda _v, k=key: self._update_option_boxes(k)
+                                  ).grid(row=r, column=2, sticky="n", padx=6, pady=3)
+                boxes = []
+                for j, v in enumerate([var] + self.field_extra[key]):
+                    b = self._picker_entry(cell, v, label if j == 0 else f"{label} - option {j + 1}",
+                                           lambda k=key: self._field_choices(k))
+                    b.grid(row=j, column=0, sticky="ew", pady=(0, 2))
+                    boxes.append(b)
+                self.field_widgets[key] = boxes
+                sw = ctk.CTkCheckBox(cell, text="spread evenly (use each option in turn, in random order)",
+                                     variable=self.vars[("scene.spread", key)][0], onvalue=True, offvalue=False,
+                                     font=self.font_small)
+                sw.grid(row=MAX_OPTIONS, column=0, sticky="w", pady=(0, 2))
+                self.field_spread_w[key] = sw
+                self._update_option_boxes(key)
+            if can_random:
                 ctk.CTkButton(f, text="Roll", width=50, command=lambda k=key: self.roll_one(k)
-                              ).grid(row=r, column=3, padx=2)
+                              ).grid(row=r, column=4, sticky="n", padx=2, pady=3)
             ctk.CTkButton(f, text="Clear", width=50, fg_color="gray40",
-                          command=lambda v=var: v.set("")).grid(row=r, column=4, padx=(2, 8))
-        self._build_people_section(f, len(core.SCENE_FIELDS) + 1)
+                          command=lambda k=key: self._clear_field(k)).grid(row=r, column=5, sticky="n",
+                                                                           padx=(2, 6), pady=3)
+        self._build_people_section(f, r + 1)
         for (sect, _key), (var, _kind) in list(self.vars.items()):
             if sect in ("scene.random", "scene.random_people"):
                 var.trace_add("write", self._update_ignored_text)
+        for k, cv in self.field_count.items():
+            cv.trace_add("write", lambda *_, k=k: self._update_option_boxes(k))
+        for k, cv in self.people_count.items():
+            cv.trace_add("write", lambda *_: self._update_people_rows())
         self.random_master.trace_add("write", self._update_ignored_text)
         self._update_ignored_text()
 
@@ -635,34 +678,70 @@ class App(ctk.CTk):
             "Random OFF - empty fields are left for the LLM to decide"))
 
     def _build_people_section(self, f, row: int):
-        """One row per character; rows follow the 'Number of characters' field."""
+        """One row per character; rows follow 'Number of characters'. Each column can hold 1-6 options
+        per character (one is used per prompt)."""
         ctk.CTkLabel(f, text="Characters", font=self.font_head, anchor="w").grid(
-            row=row, column=0, columnspan=5, sticky="w", padx=8, pady=(14, 0))
+            row=row, column=0, columnspan=6, sticky="w", padx=6, pady=(14, 0))
         self.people_note = ctk.CTkLabel(f, text="", text_color=MUTED, anchor="w", justify="left", wraplength=1000)
-        self.people_note.grid(row=row + 1, column=0, columnspan=5, sticky="w", padx=8)
+        self.people_note.grid(row=row + 1, column=0, columnspan=6, sticky="w", padx=6)
         pf = ctk.CTkFrame(f, fg_color="transparent")
-        pf.grid(row=row + 2, column=0, columnspan=5, sticky="ew", padx=4)
+        pf.grid(row=row + 2, column=0, columnspan=6, sticky="ew", padx=4)
         for c in range(1, len(core.PERSON_FIELDS) + 1):
-            pf.grid_columnconfigure(c, weight=1)
+            pf.grid_columnconfigure(c, weight=1, uniform="pcol")
         ctk.CTkLabel(pf, text="#", text_color=MUTED).grid(row=0, column=0, padx=4)
+        self.people_spread_w = {}
         for c, (k, label) in enumerate(core.PERSON_FIELDS, start=1):
             head = ctk.CTkFrame(pf, fg_color="transparent")
             head.grid(row=0, column=c, sticky="w", padx=4)
-            ctk.CTkLabel(head, text=label, font=self.font_small).pack(side="left")
+            ctk.CTkLabel(head, text=label, font=self.font_small).grid(row=0, column=0, columnspan=3, sticky="w")
             ctk.CTkCheckBox(head, text="random", variable=self.bind_var("scene.random_people", k, bool),
-                            onvalue=True, offvalue=False, width=24, font=self.font_small).pack(side="left", padx=6)
-        self.people_rows = []
+                            onvalue=True, offvalue=False, width=24, font=self.font_small
+                            ).grid(row=1, column=0, sticky="w")
+            ctk.CTkLabel(head, text="options", font=self.font_small, text_color=MUTED).grid(row=1, column=1, padx=(8, 2))
+            ctk.CTkOptionMenu(head, values=[str(i) for i in range(1, MAX_OPTIONS + 1)], width=48,
+                              variable=self.people_count[k], font=self.font_small,
+                              command=lambda _v: self._update_people_rows()).grid(row=1, column=2)
+            sw = ctk.CTkCheckBox(head, text="spread evenly", variable=self.vars[("scene.spread_people", k)][0],
+                                 onvalue=True, offvalue=False, width=24, font=self.font_small)
+            sw.grid(row=2, column=0, columnspan=3, sticky="w")
+            self.people_spread_w[k] = sw
+        self.people_rows = []            # per character: [number label, cell frame per column]
+        self.people_boxes = []           # per character: {key: [boxes]}
         for i in range(core.MAX_CHARACTERS):
             widgets = [ctk.CTkLabel(pf, text=str(i + 1), width=20)]
-            widgets[0].grid(row=i + 1, column=0, padx=4, pady=2)
+            widgets[0].grid(row=i + 1, column=0, padx=4, pady=2, sticky="n")
+            boxes = {}
             for c, (k, label) in enumerate(core.PERSON_FIELDS, start=1):
-                cb = self._picker_entry(pf, self.people_vars[i][k], f"Character {i + 1}: {label}",
-                                        lambda k=k: self._person_choices(k), width=110)
-                cb.grid(row=i + 1, column=c, sticky="ew", padx=4, pady=2)
-                widgets.append(cb)
+                cell = ctk.CTkFrame(pf, fg_color="transparent")
+                cell.grid(row=i + 1, column=c, sticky="new", padx=4, pady=2)
+                cell.grid_columnconfigure(0, weight=1)
+                boxes[k] = []
+                for j, v in enumerate([self.people_vars[i][k]] + self.people_extra[i][k]):
+                    b = self._picker_entry(cell, v, f"Character {i + 1}: {label}" + (f" - option {j + 1}" if j else ""),
+                                           lambda k=k: self._person_choices(k), width=110)
+                    b.grid(row=j, column=0, sticky="ew", pady=(0, 2))
+                    boxes[k].append(b)
+                widgets.append(cell)
             self.people_rows.append(widgets)
+            self.people_boxes.append(boxes)
         self.vars[("scene.fields", "characters")][0].trace_add("write", lambda *_: self._update_people_rows())
         self._update_people_rows()
+
+    @staticmethod
+    def _count(var) -> int:
+        v = str(var.get()).strip()
+        return min(max(int(v), 1), MAX_OPTIONS) if v.isdigit() else 1
+
+    def _update_option_boxes(self, key: str):
+        boxes = getattr(self, "field_widgets", {}).get(key)
+        if not boxes or key == "characters":
+            return
+        n = self._count(self.field_count[key])
+        for j, b in enumerate(boxes):
+            (b.grid if j < n else b.grid_remove)()
+        sw = self.field_spread_w.get(key)
+        if sw is not None:
+            (sw.grid if n > 1 else sw.grid_remove)()
 
     def _people_count(self) -> int:
         v = self.vars[("scene.fields", "characters")][0].get().strip()
@@ -672,13 +751,20 @@ class App(ctk.CTk):
         if not hasattr(self, "people_rows"):
             return
         n = self._people_count()
+        counts = {k: self._count(self.people_count[k]) for k in core.PERSON_KEYS}
         for i, widgets in enumerate(self.people_rows):
             for w in widgets:
                 (w.grid if i < n else w.grid_remove)()
+            for k, boxes in self.people_boxes[i].items():
+                for j, b in enumerate(boxes):
+                    (b.grid if j < counts[k] else b.grid_remove)()
+        for k, sw in getattr(self, "people_spread_w", {}).items():
+            (sw.grid if counts[k] > 1 else sw.grid_remove)()
         self.people_note.configure(text=(
-            f"Describe each of the {n} character(s). A ticked 'random' column is random for everyone (typed text is "
-            f"ignored); unticked columns use what you typed, and empty boxes are left for the LLM. "
-            f"Ages must be 18+ (e.g. 30 or early 30s). Typed roles build the Subject line."
+            f"Describe each of the {n} character(s). Roles here are who is in the image (they build the "
+            f"'Characters' line). A ticked 'random' column is random for everyone (typed text is ignored); "
+            f"unticked columns use what you typed, and empty boxes are left for the LLM. 'options' gives each "
+            f"character 2-6 boxes in that column, and one of them is used per prompt. Ages must be 18+."
             if n else "Set 'Number of characters' above (1-6) to describe each person here. With a random count, "
                       "ticked 'random' columns are still filled in for every character."))
 
@@ -690,21 +776,22 @@ class App(ctk.CTk):
         if not hasattr(self, "random_master"):
             return
         master = bool(self.random_master.get())
-        for key, w in getattr(self, "field_widgets", {}).items():
+        for key, ws in getattr(self, "field_widgets", {}).items():
             rv = self.vars.get(("scene.random", key))
             ignored = master and rv is not None and bool(rv[0].get())
-            target = getattr(w, "entry", w)
-            try:
-                target.configure(text_color=self.TEXT_IGNORED if ignored else self.TEXT_ON)
-            except Exception:
-                pass
-        for widgets in getattr(self, "people_rows", []):
-            for (k, _), w in zip(core.PERSON_FIELDS, widgets[1:]):
-                ignored = master and bool(self.vars[("scene.random_people", k)][0].get())
+            for w in ws:
                 try:
                     getattr(w, "entry", w).configure(text_color=self.TEXT_IGNORED if ignored else self.TEXT_ON)
                 except Exception:
                     pass
+        for boxes in getattr(self, "people_boxes", []):
+            for k, ws in boxes.items():
+                ignored = master and bool(self.vars[("scene.random_people", k)][0].get())
+                for w in ws:
+                    try:
+                        getattr(w, "entry", w).configure(text_color=self.TEXT_IGNORED if ignored else self.TEXT_ON)
+                    except Exception:
+                        pass
 
     def refresh_field_choices(self):
         pass                                   # pickers read self.presets each time they open
@@ -713,35 +800,60 @@ class App(ctk.CTk):
         v = self.vars[("scene.fields", "characters")][0].get().strip()
         return int(v) if v.isdigit() else None
 
+    def _field_vars(self, key: str) -> list:
+        """The visible value variables of a scene field (box 1 + the extra option boxes in use)."""
+        n = 1 if key == "characters" else self._count(self.field_count[key])
+        return ([self.vars[("scene.fields", key)][0]] + self.field_extra[key])[:n]
+
     def roll_one(self, key: str):
-        var = self.vars[("scene.fields", key)][0]
-        var.set(core.roll_field(key, self.presets, self.rng, self._n_chars()))
+        """Fill the field (every visible option box, all different) with random values; unticks Random."""
+        vs = self._field_vars(key)
+        used = set()
+        for v in vs:
+            val = ""
+            for _ in range(20):
+                val = core.roll_field(key, self.presets, self.rng, self._n_chars())
+                if val not in used:
+                    break
+            used.add(val)
+            v.set(val)
         if ("scene.random", key) in self.vars:
-            self.vars[("scene.random", key)][0].set(False)     # rolled = use this value
+            self.vars[("scene.random", key)][0].set(False)     # rolled = use these values
+
+    def _clear_field(self, key: str):
+        self.vars[("scene.fields", key)][0].set("")
+        for v in self.field_extra.get(key, []):
+            v.set("")
 
     def roll_all(self):
         for key, _, _, can_random in core.SCENE_FIELDS:
-            if can_random and not self.vars[("scene.fields", key)][0].get().strip():
+            if key in HIDDEN_FIELDS:
+                continue
+            if can_random and not any(v.get().strip() for v in self._field_vars(key)):
                 self.roll_one(key)
         for i in range(self._people_count()):
             for k in core.PERSON_KEYS:
-                var = self.people_vars[i][k]
                 pool = self.presets.get(k) or (self.presets.get("subject") if k == "role" else [])
-                if not var.get().strip() and pool:
-                    var.set(self.rng.choice(pool))
+                n = self._count(self.people_count[k])
+                vs = ([self.people_vars[i][k]] + self.people_extra[i][k])[:n]
+                if pool and not any(v.get().strip() for v in vs):
+                    for v, val in zip(vs, self.rng.sample(pool, min(n, len(pool)))):
+                        v.set(val)
                     self.vars[("scene.random_people", k)][0].set(False)
 
     def clear_fields(self):
         for key in core.FIELD_KEYS:
-            self.vars[("scene.fields", key)][0].set("")
-        for row in self.people_vars:
-            for v in row.values():
+            self._clear_field(key)
+        for i, row in enumerate(self.people_vars):
+            for k, v in row.items():
                 v.set("")
+                for x in self.people_extra[i][k]:
+                    x.set("")
         self.scene_ideas.delete("1.0", "end")
 
     def set_all_random(self, on: bool):
-        for (sect, _), (var, _) in self.vars.items():
-            if sect == "scene.random":
+        for (sect, key), (var, _) in self.vars.items():
+            if sect == "scene.random" and key not in HIDDEN_FIELDS:
                 var.set(on)
 
     # ------------------------------------------------------------------ comic tab
@@ -852,6 +964,8 @@ class App(ctk.CTk):
         self.row(f, "Wait for images", "comfy", "wait_for_images", bool, hint="OFF = just queue them in ComfyUI")
         self.row(f, "Download images", "comfy", "download_images", bool, hint="copy them into the run folder/images")
         self.row(f, "Free ComfyUI VRAM when done", "comfy", "free_vram_after", bool)
+        self.row(f, "Missing LoRAs", "comfy", "missing_loras", choices=("skip", "stop"),
+                 hint="a LoRA file ComfyUI doesn't have: skip = leave it out (warned in the Log), stop = stop the run")
         self.row(f, "Wait for LLM VRAM release (s)", "comfy", "vram_wait", float,
                  hint="after unloading the LLM, wait until the memory is really free (0 = don't wait)")
         self.row(f, "Timeout per image (s)", "comfy", "timeout", float)
@@ -1081,7 +1195,7 @@ class App(ctk.CTk):
         def heading(text):
             self.section_label(body, text)
 
-        def entry_row(label, value, pick_list=None, hint=""):
+        def entry_row(label, value, pick_list=None, hint="", hint_color=MUTED):
             r = body._row
             ctk.CTkLabel(body, text=label, anchor="w").grid(row=r, column=0, sticky="w", **PAD)
             var = tk.StringVar(self, value="" if value is None else str(value))
@@ -1091,7 +1205,7 @@ class App(ctk.CTk):
                     var, label, lambda: [(x, x) for x in lists.get(pick_list, [])],
                     refresh=lambda: self._comfy_refresh_sync(pick_list))).grid(row=r, column=2, **PAD)
             if hint:
-                ctk.CTkLabel(body, text=hint, text_color=MUTED, anchor="w", font=self.font_small
+                ctk.CTkLabel(body, text=hint, text_color=hint_color, anchor="w", font=self.font_small
                              ).grid(row=r, column=3, sticky="w", **PAD)
             body._row += 1
             return var
@@ -1107,11 +1221,14 @@ class App(ctk.CTk):
             kind = {"ckpt_name": "checkpoints", "unet_name": "diffusion_models", "vae_name": "vae"}
             for nid, field, val in loaders:
                 lst = kind.get(field, "text_encoders")
-                var = entry_row(f"{doc.title(nid)} {field}", val, lst)
+                gone = bool(lists.get(lst)) and wfmod.norm_name(val) not in {wfmod.norm_name(x) for x in lists[lst]}
+                var = entry_row(f"{doc.title(nid)} {field}", val, lst,
+                                hint="NOT FOUND in ComfyUI's model list" if gone else "", hint_color="#e05555")
                 self.wf_rows.append(("input", (nid, field, str), var))
 
         heading("LoRAs")
         loras = doc.loras()
+        missing_loras: list[str] = []
         if not loras:
             ctk.CTkLabel(body, text="No LoRAs in this workflow.", text_color=MUTED, anchor="w").grid(
                 row=body._row, column=0, columnspan=4, sticky="w", **PAD)
@@ -1128,6 +1245,9 @@ class App(ctk.CTk):
                 refresh=lambda: self._comfy_refresh_sync("loras"))).grid(row=r, column=2, **PAD)
             sub = ctk.CTkFrame(body, fg_color="transparent")
             sub.grid(row=r, column=3, sticky="w", **PAD)
+            if lists.get("loras") and wfmod.norm_name(e["name"]) not in {wfmod.norm_name(x) for x in lists["loras"]}:
+                ctk.CTkLabel(sub, text="NOT FOUND in ComfyUI", text_color="#e05555").pack(side="left", padx=(0, 8))
+                missing_loras.append(e["name"])
             ctk.CTkLabel(sub, text="strength").pack(side="left")
             strength = tk.StringVar(self, value=str(e["strength"]))
             ctk.CTkEntry(sub, textvariable=strength, width=60).pack(side="left", padx=4)
@@ -1137,6 +1257,11 @@ class App(ctk.CTk):
             self.wf_rows.append(("lora", e, (on, name, strength)))
         ctk.CTkButton(body, text="Add LoRA...", width=110, command=self._wf_add_lora).grid(
             row=body._row, column=0, sticky="w", **PAD)
+        if missing_loras:
+            ctk.CTkLabel(body, text=f"{len(missing_loras)} LoRA file(s) not found in ComfyUI's list: pick the right "
+                                    "file with Choose..., or Remove them. (List out of date? Refresh it on the "
+                                    "ComfyUI tab.)", text_color="#e05555", anchor="w", wraplength=700, justify="left"
+                         ).grid(row=body._row, column=1, columnspan=3, sticky="w", **PAD)
         body._row += 1
 
         heading("Resolution")
@@ -1696,11 +1821,25 @@ class App(ctk.CTk):
         for t, v in self.target_vars.items():
             v.set(t in cfg["generation"]["targets"])
         self.rot_models_var.set("\n".join(cfg["comfy"].get("rotation_models") or []))
+        # option lists: box 1 = the field variable, the rest go into the extra boxes
+        for k in core.FIELD_KEYS:
+            vals = core.field_values(core.norm_value(cfg["scene"]["fields"].get(k, "")))[:MAX_OPTIONS]
+            self.vars[("scene.fields", k)][0].set(vals[0] if vals else "")
+            for j, v in enumerate(self.field_extra[k]):
+                v.set(vals[j + 1] if j + 1 < len(vals) else "")
+            self.field_count[k].set(str(max(1, len(vals))))
         people = cfg["scene"].get("people") or []
+        widest = {k: 1 for k in core.PERSON_KEYS}
         for i, row in enumerate(self.people_vars):
             p = people[i] if i < len(people) and isinstance(people[i], dict) else {}
             for k, v in row.items():
-                v.set(str(p.get(k, "") or ""))
+                vals = core.field_values(core.norm_value(p.get(k, "")))[:MAX_OPTIONS]
+                v.set(vals[0] if vals else "")
+                for j, x in enumerate(self.people_extra[i][k]):
+                    x.set(vals[j + 1] if j + 1 < len(vals) else "")
+                widest[k] = max(widest[k], len(vals))
+        for k, n in widest.items():
+            self.people_count[k].set(str(n))
         self.count_var.set(str(cfg["generation"]["count"]))
         self._show_cfg_path()
         self._backend_changed()
@@ -1740,7 +1879,12 @@ class App(ctk.CTk):
                 d[key] = str(raw)
         cfg["output"]["formats"] = [f for f, v in self.format_vars.items() if v.get()]
         cfg["generation"]["targets"] = [t for t, v in self.target_vars.items() if v.get()]
-        cfg["scene"]["people"] = [{k: v.get().strip() for k, v in row.items()} for row in self.people_vars]
+        for k in core.FIELD_KEYS:
+            cfg["scene"]["fields"][k] = core.norm_value([v.get() for v in self._field_vars(k)])
+        def cell(i, k):
+            n = self._count(self.people_count[k])
+            return core.norm_value([x.get() for x in ([self.people_vars[i][k]] + self.people_extra[i][k])[:n]])
+        cfg["scene"]["people"] = [{k: cell(i, k) for k in core.PERSON_KEYS} for i in range(core.MAX_CHARACTERS)]
         cfg["comfy"]["rotation_models"] = [x.strip() for x in self.rot_models_var.get().splitlines() if x.strip()]
         try:
             cfg["generation"]["count"] = int(self.count_var.get().strip())

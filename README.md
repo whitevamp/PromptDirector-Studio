@@ -1,4 +1,4 @@
-# PromptDirector Studio v2.9.2
+# PromptDirector Studio v3.0.1
 
 by **whitevamp**, licensed under CC BY-NC-SA 4.0 (free for non-commercial use; see [License](#license)).
 
@@ -49,7 +49,9 @@ The GUI uses an installed font: Roboto if present, otherwise Noto Sans, DejaVu S
 
 ## How scene fields work
 
-The fields are style, number of characters, subject, action, camera angle, shot/distance, lighting, location, time/weather, composition and extra notes.
+The fields are style, number of characters, action, camera angle, shot/distance, lighting, location, time/weather, composition and extra notes. Who is in the image comes from the **Role** column of the Characters table (there's no separate Subject field since v3.0).
+
+Every field row has the same controls: a **Random** box, an **Options** number, the value box(es) with a **...** list button, then **Roll** and **Clear**.
 
 | Field state | Result |
 |---|---|
@@ -58,7 +60,16 @@ The fields are style, number of characters, subject, action, camera angle, shot/
 | **Random** unticked, box empty | left out, so the LLM picks what fits the scene |
 | Master **Random OFF** | every typed value is used; empty boxes are left to the LLM |
 
-**Roll** picks a value now and unticks Random for that field, so the rolled value is used. The same rules apply to every column in the Characters table and to the per-panel picks in comic mode.
+**Roll** picks a value now (one for each option box in use) and unticks Random for that field, so the rolled values are used.
+
+### Options: one of several values per prompt
+
+Set a field's **Options** to 2-6 and that many boxes appear. Fill them in (type, or use each box's list button), and every prompt uses **one** of them. Example: Location with 3 options (foggy pier, rooftop garden in Tokyo, abandoned subway station) gives each prompt one of those three places.
+
+- **Spread evenly** (shown when Options is 2 or more): instead of a pure random pick, the app goes through all the options in shuffled rounds, so 9 prompts with 3 locations give exactly 3 of each. Without it, the pick is random every time.
+- A ticked **Random** box still overrides the field, exactly like a single value.
+- Comic mode: each panel picks its own option for the per-panel fields (camera angle, shot, and location or action depending on the mode).
+- The prompt header always shows the option that was used, and the Detail check verifies the LLM used it. The same rules apply to every column in the Characters table and to the per-panel picks in comic mode.
 
 Lighting and composition are not random by default, so the LLM can match them to the scene (the file's "NO FIXED STYLE" rule).
 If there are 3 or more characters, random shots never pick close-ups.
@@ -99,7 +110,9 @@ This tab opens the workflow file set on the ComfyUI tab.
 
 - **Prompt:** shows where the prompt goes (`%PROMPT%`, or the auto-detected box).
 - **Models:** every model the workflow loads (checkpoint, diffusion model, text encoders, VAE), each changeable with **Choose...**.
-- **LoRAs:** turn each on/off, change the file or strength, remove it, or **Add LoRA...**. Works with the rgthree Power Lora Loader and with LoraLoader / LoraLoaderModelOnly nodes. Removed nodes are unwired cleanly; added LoRAs go into the Power Lora Loader, or are wired in as a new node after the model loader.
+- **LoRAs:** turn each on/off, change the file or strength, remove it, or **Add LoRA...**. Works with the rgthree Power Lora Loader and LoraLoader / LoraLoaderModelOnly nodes, and finds LoRAs in other nodes too: single loaders (LoraLoader|pysssss, Nunchaku and similar) and stacks with numbered slots (CR LoRA Stack, LoRA Stacker, Lora Loader Stack). Removed nodes are unwired cleanly, and removed stack slots are set to None; added LoRAs go into the Power Lora Loader, or are wired in as a new node after the model loader.
+- **Missing files:** a LoRA or model that isn't in ComfyUI's list is marked **NOT FOUND** in red. Pick the right file with Choose... or remove it. If the list is out of date, refresh it on the ComfyUI tab.
+- **Checked before every run:** when a run starts, before any LLM time is spent, the app asks ComfyUI for its current model and LoRA lists and checks the workflow against them. A missing **model** stops the run straight away with the node and file name. A missing **LoRA** is left out of every image with a warning in the Log (**Missing LoRAs = skip**, the default), or stops the run (**stop**). The workflow file itself isn't changed.
 - **Resolution:** the workflow's size, plus **App suggests** with the reasoning. For example, for a 2x3 comic page and a workflow that upscales ×1.5 in a second pass, it suggests starting at 832×1264 so the result ends near 1248×1888. **Use suggestion** applies it.
   - **Size used when sending:** `auto` (comic pages use the app's size × comic scale), `workflow` (keep the size above) or `custom` (the ComfyUI tab's Width/Height).
   - **Match upscale** sets the comic scale for you.
@@ -225,7 +238,7 @@ Below the scene fields, the **Characters** table shows one row per person. The n
 
 | Column | Notes |
 |---|---|
-| Role | e.g. "a knight". Filled-in roles build the Subject line |
+| Role | e.g. "a knight". The roles build the "Characters:" line (who is in the image) |
 | Age | adults only: 18+ (e.g. `30` or `early 30s`); random ages are adult ranges |
 | Ethnicity | e.g. East Asian, Black, Hispanic/Latino; random is off by default (the LLM chooses) |
 | Hair color / Hair length / style | random by default |
@@ -233,12 +246,16 @@ Below the scene fields, the **Characters** table shows one row per person. The n
 
 Scene fields and character boxes have a **...** button that opens the searchable picker for that preset list (it stays open until you choose; type to filter). You can also type straight into the box. Each column has a **random** checkbox. A filled-in box is used for every prompt; an empty box is randomized (if ticked and Random is ON) or left to the LLM. Each person is sent as a line like `Character 1: a knight; age 30; black hair (long straight); wearing plate armor`, and the system prompt tells the LLM to use each line for that character. Comic mode uses the same cast in every panel.
 
-CLI: `--person "role=a knight;age=30;hair_color=black;clothing=plate armor"`, repeated once per person.
+Each column header also has an **options** number: set it to 2-6 and every character gets that many boxes in that column, one of which is used per prompt (e.g. Character 1's hair: jet black or silver; Character 2's: auburn or blonde). **Spread evenly** works per column, as above.
+
+Old configs with a Subject such as "a knight and a sorceress" are converted on load: the subject becomes the roles of characters 1 and 2, and Number of characters is set to match.
+
+CLI: `--person "role=a knight;age=30;hair_color=black|silver;clothing=plate armor"`, repeated once per person. Values typed on the command line are always used (their random box is switched off).
 
 ## GUI tabs
 
 - **Comic**: comic panel layout on/off, grid, mode, format, suggested image size
-- **Scene**: fields, per-field *random* boxes, 🎲 (roll a value now), ✕ (clear), master Random switch, free-text ideas
+- **Scene**: fields with Random, Options (1-6 values per field) and Spread evenly, Roll, Clear, the Characters table, master Random switch, free-text ideas
 - **Results**: prompts appear as they are made; Copy all; Open output folder
 - **Log**: live log, with warnings and errors colored
 - **Backend & Model**: backend type, host, API key, model (**Choose…** opens a searchable list that loads by itself; **Refresh model list** re-reads it from the server), Thinking, .gguf path, sampling settings, Test connection
@@ -255,7 +272,8 @@ The bottom bar (count, Generate, Stop, Preview scenes) is on every tab. **Previe
 ```bash
 python promptdirector.py -n 20
 python promptdirector.py -n 5 --style "anime illustration" --characters 2 --camera-angle "low angle"
-python promptdirector.py -n 5 --subject "a knight and a sorceress" --no-random
+python promptdirector.py -n 5 --person "role=a knight" --person "role=a sorceress" --no-random
+python promptdirector.py -n 9 --location "foggy pier|rooftop garden, Tokyo|subway station" --spread location
 python promptdirector.py -n 5 --random-fields location time_weather   # only these may be random
 python promptdirector.py -n 10 --target krea2 illustrious             # Krea 2 length + Illustrious tags
 python promptdirector.py -n 5 --comic 2x3 --comic-mode story         # 6-panel comic pages
